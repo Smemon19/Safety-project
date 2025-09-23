@@ -43,14 +43,95 @@ An intelligent documentation crawler and retrieval-augmented generation (RAG) sy
    ```
 
 3. **Set up environment variables:**
-   - Copy `.env.example` to `.env`
-   - Edit `.env` with your API keys and preferences:
-     ```env
-     OPENAI_API_KEY=your_openai_api_key
-     MODEL_CHOICE=gpt-4.1-mini  # or your preferred OpenAI model
-     ```
+   - Copy `.env.example` to `.env` (see Project A vs Project B examples below)
+   - Edit `.env` with your API keys and Vertex AI Vector Search identifiers
 
 ---
+
+## Vertex AI Vector Search: Project A vs Project B
+
+This repository was forked from an older project, and now needs strict isolation across projects.
+
+- Project A uses its original Vertex index and namespace.
+- Project B MUST use a brand-new index ID and a distinct namespace.
+
+All code now reads configuration only from `.env` via a centralized module. No IDs are hard-coded.
+
+### Required environment variables (.env)
+
+```env
+GCP_PROJECT_ID=your-project
+GCP_REGION=us-central1
+VECTOR_SEARCH_INDEX_ID=projects/.../locations/.../indexes/...
+VECTOR_SEARCH_ENDPOINT_ID=projects/.../locations/.../indexEndpoints/...
+NAMESPACE=project-b
+```
+
+Optional:
+
+```env
+# Set if you want to run debug script using find_neighbors directly
+VECTOR_SEARCH_DEPLOYED_INDEX_ID=...
+
+# Override inferred embedding dimensions when creating a new index
+EMBEDDING_DIMENSIONS=384
+```
+
+### Example .env for Project A
+
+```env
+GCP_PROJECT_ID=project-a
+GCP_REGION=us-central1
+VECTOR_SEARCH_INDEX_ID=projects/project-a/locations/us-central1/indexes/IDX_A
+VECTOR_SEARCH_ENDPOINT_ID=projects/project-a/locations/us-central1/indexEndpoints/ENDPT_A
+NAMESPACE=project-a
+```
+
+### Example .env for Project B
+
+```env
+GCP_PROJECT_ID=project-b
+GCP_REGION=us-central1
+VECTOR_SEARCH_INDEX_ID=projects/project-b/locations/us-central1/indexes/IDX_B
+VECTOR_SEARCH_ENDPOINT_ID=projects/project-b/locations/us-central1/indexEndpoints/ENDPT_B
+NAMESPACE=project-b
+```
+
+On startup, the app logs the active project, region, index, endpoint, and namespace.
+
+## Create a new Vertex index (Project B)
+
+Use the helper script to create and deploy a new index, then copy the IDs into `.env`.
+
+```bash
+chmod +x ops/vertex/create_index.sh
+ops/vertex/create_index.sh \
+  --project your-gcp-project \
+  --region us-central1 \
+  --index-name cal-vs-project-b \
+  --dimensions 384 \
+  --endpoint-name cal-vs-endpoint-b
+```
+
+The script prints:
+
+```
+VECTOR_SEARCH_INDEX_ID=projects/.../indexes/...
+VECTOR_SEARCH_ENDPOINT_ID=projects/.../indexEndpoints/...
+VECTOR_SEARCH_DEPLOYED_INDEX_ID=...
+```
+
+Paste these into your `.env`.
+
+## Verify isolation
+
+Run the debug script to verify namespace isolation quickly:
+
+```bash
+python scripts/debug_vertex_isolation.py
+```
+
+It prints the active config and runs a small neighbor query using your namespace. It warns if results are found in an expected-empty namespace.
 
 ## Usage
 

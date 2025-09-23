@@ -35,6 +35,7 @@ from utils import (
     make_chunk_metadata,
     resolve_embedding_backend_and_model,
 )
+from config import get_namespace
 from rag_agent import RagAgent
 
 def smart_chunk_markdown(markdown: str, max_len: int = 1000, overlap_chars: int = 150) -> List[str]:
@@ -296,6 +297,11 @@ def main():
                 pdf_ocr_oem=args.pdf_ocr_oem,
                 pdf_diagnostic_dir=args.pdf_diagnostic_dir,
             )
+
+    # Log namespace used for ingestion if set
+    ns = get_namespace()
+    if ns:
+        print(f"[ingest] Namespace active: '{ns}'")
 
     # Run the async function
     asyncio.run(process_input())

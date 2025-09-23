@@ -1,0 +1,1 @@
+Cal Project B test doc. Namespace should be calrag_projectb only.

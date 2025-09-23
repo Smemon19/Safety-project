@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 import dotenv
+from config import log_active_config, get_namespace
 from pydantic_ai import RunContext
 from pydantic_ai.agent import Agent
 from openai import AsyncOpenAI
@@ -48,6 +49,10 @@ from verify import verify_answer
 # Ensure appdata scaffold and load .env from there so user config persists across updates
 ensure_appdata_scaffold()
 dotenv.load_dotenv(dotenv_path=get_env_file_path(), override=True)
+log_active_config(prefix="[agent-config]")
+ns = get_namespace()
+if ns:
+    print(f"[agent] Namespace active: '{ns}'")
 
 # Check for OpenAI API key
 if not os.getenv("OPENAI_API_KEY"):

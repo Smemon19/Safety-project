@@ -19,21 +19,26 @@ from pydantic_ai.messages import (
 )
 
 # Resolve and load .env from writable AppData directory; create scaffold on first run
-from utils import get_chroma_client, resolve_embedding_backend_and_model, get_env_file_path, ensure_appdata_scaffold, get_default_chroma_dir
+from utils import get_chroma_client, resolve_embedding_backend_and_model, get_env_file_path, ensure_appdata_scaffold, get_default_chroma_dir, resolve_collection_name
+from config import log_active_config, get_namespace
 
 ensure_appdata_scaffold()
 load_dotenv(dotenv_path=get_env_file_path(), override=True)
+log_active_config(prefix="[ui-config]", allow_missing=False)
 
 from rag_agent import get_agent, RAGDeps
 
 async def get_agent_deps(header_contains: str | None, source_contains: str | None):
-    resolved_collection = "docs_ibc_v2"
+    resolved_collection = resolve_collection_name(None)
     # Log once on startup via Streamlit status text and server log
     print(f"[ui] Using ChromaDB collection: '{resolved_collection}'")
     st.sidebar.caption(f"Active collection: {resolved_collection}")
     backend, model = resolve_embedding_backend_and_model()
     # Also display embeddings info once
     st.sidebar.caption(f"Embeddings: {backend} / {model}")
+    ns = get_namespace()
+    if ns:
+        st.sidebar.caption(f"Namespace: {ns}")
     return RAGDeps(
         chroma_client=get_chroma_client(get_default_chroma_dir()),
         collection_name=resolved_collection,

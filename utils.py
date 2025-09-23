@@ -12,6 +12,11 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime, timezone
 from pathlib import Path
 from utils_normalize import normalize_inequalities, expand_numeric_tokens, pair_unit_synonyms
+try:
+    from config import get_namespace
+except Exception:
+    def get_namespace() -> str:  # type: ignore
+        return ""
 
 _embedding_factory_logged: bool = False
 _DEFAULT_OVERLAP_CHARS: int = 150
@@ -285,6 +290,10 @@ def make_chunk_metadata(
         "mime_type": mime_type or "",
         "title": title or "",
     }
+    # Enforce namespace isolation in metadata if configured
+    namespace_value = get_namespace()
+    if namespace_value:
+        meta["namespace"] = namespace_value
     return meta
 
 def get_default_collection_name() -> str:
@@ -467,11 +476,22 @@ def query_collection(
     Returns:
         Query results containing documents, metadatas, distances, and ids
     """
-    # Query the collection
+    # Merge namespace filter if configured
+    ns = get_namespace()
+    final_where: Optional[Dict[str, Any]] = None
+    if ns:
+        final_where = dict(where or {})
+        # Chroma metadata equality filter
+        final_where.update({"namespace": ns})
+        print(f"[query] Applying namespace filter where namespace='{ns}'")
+    else:
+        final_where = where
+
+    # Query the collection with optional namespace filter
     return collection.query(
         query_texts=[query_text],
         n_results=n_results,
-        where=where,
+        where=final_where,
         include=["documents", "metadatas", "distances"]
     )
 
@@ -532,12 +552,17 @@ def keyword_search_collection(
     results_ids: List[str] = []
 
     offset = 0
+    ns = get_namespace()
+    if ns:
+        print(f"[keyword_scan] Restricting scan to namespace='{ns}'")
     while offset < total and len(results_docs) < max_results:
         res = collection.get(include=["documents", "metadatas"], limit=min(batch_size, total - offset), offset=offset)
         docs = res.get("documents", [])
         metas = res.get("metadatas", [])
         ids = res.get("ids", [])
         for doc, meta, id_ in zip(docs, metas, ids):
+            if ns and (meta or {}).get("namespace") != ns:
+                continue
             text = (doc or "").lower()
             if any(sub in text for sub in normalized):
                 results_docs.append(doc)
