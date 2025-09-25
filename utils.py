@@ -25,9 +25,15 @@ _DEFAULT_OVERLAP_CHARS: int = 150
 def get_appdata_base_dir() -> str:
     """Return the base writable application data directory for this app.
 
-    - On Windows: %LOCALAPPDATA%\\CalRAG
+    - On Windows: %LOCALAPPDATA%\CalRAG
     - On other OS: ~/.calrag
     """
+    try:
+        # On Google Cloud Run, the filesystem is read-only except for /tmp
+        if os.getenv("K_SERVICE"):
+            return "/tmp/.calrag"
+    except Exception:
+        pass
     try:
         local_appdata = os.getenv("LOCALAPPDATA")
         if local_appdata:
@@ -49,8 +55,14 @@ def get_default_chroma_dir() -> str:
     Resolution order:
     1) Environment variable CHROMA_DIR (expanded, if set and non-empty)
     2) Repository-local 'chroma_db' directory (if exists and non-empty)
-    3) Appdata directory fallback: ~/.calrag/chroma (or %LOCALAPPDATA%\\CalRAG\\chroma on Windows)
+    3) Appdata directory fallback: ~/.calrag/chroma (or %LOCALAPPDATA%\CalRAG\chroma on Windows)
     """
+    # On Google Cloud Run, persist under /tmp to avoid read-only filesystem
+    try:
+        if os.getenv("K_SERVICE"):
+            return str(Path(get_appdata_base_dir()) / "chroma")
+    except Exception:
+        pass
     # 1) Explicit override via environment
     try:
         env_dir = os.getenv("CHROMA_DIR", "")

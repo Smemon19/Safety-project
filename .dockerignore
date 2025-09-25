@@ -1,0 +1,43 @@
+# VCS
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info
+.build
+.dist
+
+# Virtual envs
+.venv
+venv
+.env
+
+# OS/Editor
+.DS_Store
+.vscode
+.idea
+
+# Node
+node_modules
+
+# Local data and logs not needed in image
+chroma_db
+uploads
+logs
+*.log
+
+# Build artifacts
+build
+/dist
+
+# Cache
+.cache
+pip-cache
+
+# Firebase local state
+.firebase

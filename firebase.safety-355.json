@@ -1,0 +1,10 @@
+{
+  "hosting": {
+    "site": "safety-355",
+    "public": "public",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "redirects": [
+      { "source": "/:path*", "destination": "https://safety-355-p7qeuaparq-uc.a.run.app/:path", "type": 302 }
+    ]
+  }
+}
