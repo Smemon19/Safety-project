@@ -9,6 +9,7 @@ import asyncio
 import chromadb
 import re
 from pathlib import Path
+from collections import OrderedDict
 
 import dotenv
 from config import log_active_config, get_namespace
@@ -29,6 +30,8 @@ from utils import (
     normalize_source_url,
     build_section_path,
     make_chunk_metadata,
+    detect_section_token,
+    rerank_results,
     get_env_file_path,
     ensure_appdata_scaffold,
     get_default_chroma_dir,
@@ -45,6 +48,12 @@ from tools_calc import (
 )
 from rules_loader import load_all_rules, find_rules_by_section, find_rules_by_keywords
 from verify import verify_answer
+from generators.analyze import analyze_scope
+from generators.aha import generate_full_aha
+from generators.csp import generate_csp
+from export.docx_writer import write_aha_book, write_aha_single, write_csp_docx
+from export.html_writer import write_aha_book_html, write_csp_html, write_aha_single_html
+from export.markdown_writer import write_aha_book_md, write_csp_md, write_aha_single_md
 
 # Ensure appdata scaffold and load .env from there so user config persists across updates
 ensure_appdata_scaffold()
@@ -55,11 +64,9 @@ ns = get_namespace()
 if ns:
     print(f"[agent] Namespace active: '{ns}'")
 
-# Check for OpenAI API key
+# Do not exit hard on missing key; the UI will display a friendly error
 if not os.getenv("OPENAI_API_KEY"):
-    print("Error: OPENAI_API_KEY environment variable not set.")
-    print("Please create a .env file with your OpenAI API key or set it in your environment.")
-    sys.exit(1)
+    print("[agent] Warning: OPENAI_API_KEY is not set. Model calls will fail until configured.")
 
 
 @dataclass
@@ -218,7 +225,13 @@ class RagAgent:
                 )
                 # Build crawl_results in a uniform shape with per-chunk page numbers
                 crawl_results = [
-                    {"url": str(file_path), "text": ch.get("text", ""), "page_number": ch.get("page"), "title": ch.get("title", "")}
+                    {
+                        "url": str(file_path),
+                        "text": ch.get("text", ""),
+                        "page_number": ch.get("page"),
+                        "page_label": ch.get("page_label", ""),
+                        "title": ch.get("title", ""),
+                    }
                     for ch in pdf_chunks
                 ]
             else:
@@ -245,7 +258,7 @@ class RagAgent:
     ) -> List[Dict[str, Any]]:
         """Extract text and images from a PDF file using enhanced processing.
 
-        Returns a list of chunk dicts with keys: text, page, title.
+        Returns a list of chunk dicts with keys: text, page, title, page_label.
         """
         try:
             from pdf_loader.pdf_loader import process_pdf
@@ -277,6 +290,11 @@ class RagAgent:
                     import fitz  # PyMuPDF
                     with fitz.open(file_path) as doc:
                         pdf_title = (doc.metadata or {}).get("title") or ""
+                        # Map page numbers to labels if present
+                        try:
+                            page_labels = {i + 1: (doc.get_page_labels()[i] if doc.get_page_labels() else str(i + 1)) for i in range(len(doc))}
+                        except Exception:
+                            page_labels = {i + 1: str(i + 1) for i in range(len(doc))}
                 except Exception:
                     pdf_title = ""
                 if not pdf_title:
@@ -285,6 +303,11 @@ class RagAgent:
                 # Attach title to each chunk
                 for ch in chunks:
                     ch["title"] = pdf_title
+                    try:
+                        pnum = int(ch.get("page") or 0)
+                        ch["page_label"] = (page_labels.get(pnum) if pnum else "") if 'page_labels' in locals() else ""
+                    except Exception:
+                        ch["page_label"] = ""
                 return chunks
                 
         except ImportError as e:
@@ -374,13 +397,22 @@ class RagAgent:
                 page_numbers = [None] * len(chunk_texts)
 
             # Build per-chunk metadata
-            for chunk in chunk_texts:
+            for idx_local, chunk in enumerate(chunk_texts):
                 headers_info = self.extract_section_info(chunk)
                 headers_text = headers_info.get('headers', '')
                 section_path = build_section_path(chunk)
                 if source_type == 'pdf' and not section_path:
-                    section_path = title or ''
-                page_num = page_numbers[0] if page_numbers else None
+                    # Try to infer section token from text; fallback to title
+                    token = detect_section_token(chunk)
+                    section_path = token or title or ''
+                # Use 1:1 page number mapping when available
+                page_num = page_numbers[idx_local] if page_numbers else None
+                page_label = ''
+                try:
+                    if source_type == 'pdf':
+                        page_label = str(doc.get('page_label') or '')
+                except Exception:
+                    page_label = ''
 
                 # Increment local index per (source, section, page)
                 ctr_key = f"{normalized_url}\n{section_path}\n{page_num if page_num is not None else ''}"
@@ -393,6 +425,7 @@ class RagAgent:
                     section_path=section_path,
                     headers=headers_text,
                     page_number=page_num,
+                    page_label=page_label,
                     chunk_text=chunk,
                     title=title,
                     mime_type=mime_type,
@@ -465,15 +498,18 @@ def create_agent():
     return Agent(
         os.getenv("MODEL_CHOICE", "gpt-4.1-mini"),
         deps_type=RAGDeps,
-        system_prompt="You are a helpful assistant that answers questions based on the provided documentation. "
-                      "Use the retrieve tool to get relevant information from the documentation before answering. "
-                      "If the documentation doesn't contain the answer, clearly state that the information isn't available "
-                      "in the current documentation and provide your best general knowledge response. "
-                      "When you call a calculation tool, echo the input and output clearly in your answer, e.g., "
-                      "'For a 30 ft span with L/180: Max deflection = 2.0 in (IBC Table 1604.3). "
-                      "If a RULE SNIPPET is present, quote its values verbatim first, cite the section number, "
-                      "and avoid unrelated standards unless explicitly asked. "
-                      "If the retrieved context contains a section/table token and exact numeric terms, you MUST include those exact tokens in the answer and cite the section/table (e.g., 'IBC 2018 §1607.9' or 'Table 1604.3'). Prefer brevity and precision."
+        system_prompt=(
+            "You are a helpful assistant that answers questions based on the provided documentation. "
+            "Use the retrieve tool to get relevant information from the documentation before answering. "
+            "If the documentation doesn't contain the answer, clearly state that the information isn't available "
+            "in the current documentation and provide your best general knowledge response. "
+            "When you call a calculation tool, echo the input and output clearly in your answer, e.g., "
+            "'For a 30 ft span with L/180: Max deflection = 2.0 in (IBC Table 1604.3). "
+            "If a RULE SNIPPET is present, quote its values verbatim first, cite the section number, and avoid unrelated standards unless explicitly asked. "
+            "For every paragraph of your final answer, include citations to the retrieved context using this format: §<section>, page <label|number>, and a short \"quote anchor\" from the source chunk. "
+            "If the retrieved context contains a section/table token and exact numeric terms, you MUST include those exact tokens in the answer and cite the section/table (e.g., 'IBC 2018 §1607.9' or 'Table 1604.3'). Prefer brevity and precision. "
+            "If a user provides a scope of work and asks to build CSP and AHAs, call the build_plan tool with the provided scope text or JSON."
+        )
     )
 
 # Initialize agent as None and track the last key used to recreate if it changes
@@ -481,6 +517,10 @@ agent = None
 _last_openai_key = None
 _last_model_choice = None
 _last_retrieve_context: str = ""
+
+# Simple in-memory LRU cache for retrieval contexts
+_retrieve_cache: "OrderedDict[str, str]" = OrderedDict()
+_RETRIEVE_CACHE_CAPACITY = 128
 
 
 def get_agent():
@@ -745,8 +785,28 @@ async def retrieve(
     except Exception as e:
         print(f"[rules] Error during snippet injection: {e}")
 
-    # Vector query first
-    query_results = query_collection(collection, search_query, n_results=n_results)
+    # Cache key based on collection + query + filters
+    def _norm(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        s2 = s.strip()
+        return s2 if s2 else None
+
+    header_filter = _norm(header_contains) or _norm(getattr(context.deps, "header_contains", None))
+    source_filter = _norm(source_contains) or _norm(getattr(context.deps, "source_contains", None))
+
+    cache_key = f"{context.deps.collection_name}|{search_query}|{header_filter or ''}|{source_filter or ''}"
+    try:
+        if cache_key in _retrieve_cache:
+            val = _retrieve_cache.pop(cache_key)
+            _retrieve_cache[cache_key] = val  # move to end (most recently used)
+            return val
+    except Exception:
+        pass
+
+    # Vector query first (broad pool for reranking)
+    initial_pool = max(n_results * 4, 20)
+    query_results = query_collection(collection, search_query, n_results=initial_pool)
 
     # Hybrid fallback for numeric/table/section queries
     section_terms = build_section_search_terms(search_query)
@@ -768,16 +828,6 @@ async def retrieve(
             vec_docs.append(kw_docs[i])
             vec_metas.append(kw_metas[i])
             seen.add(id_)
-
-    # Coalesce filter values: tool args override deps; treat blank/whitespace as None
-    def _norm(s: Optional[str]) -> Optional[str]:
-        if s is None:
-            return None
-        s2 = s.strip()
-        return s2 if s2 else None
-
-    header_filter = _norm(header_contains) or _norm(getattr(context.deps, "header_contains", None))
-    source_filter = _norm(source_contains) or _norm(getattr(context.deps, "source_contains", None))
 
     before_count = len(vec_ids)
 
@@ -836,15 +886,16 @@ async def retrieve(
         }
         return format_results_as_context(query_results)
 
-    # Trim to n_results after optional filtering or section lock
+    # Lightweight rerank to select the best n_results
     if lock_candidates:
         query_results = lock_candidates
     else:
+        rr_ids, rr_docs, rr_metas = rerank_results(search_query, vec_ids, vec_docs, vec_metas, n_results)
         query_results = {
-            "ids": [vec_ids[:n_results]],
-            "documents": [vec_docs[:n_results]],
-            "metadatas": [vec_metas[:n_results]],
-            "distances": [[0.0] * min(n_results, len(vec_ids))],  # placeholder
+            "ids": [rr_ids],
+            "documents": [rr_docs],
+            "metadatas": [rr_metas],
+            "distances": [[0.0] * len(rr_ids)],
         }
     
     # Format the results as context (prepend rules and table lookup if available)
@@ -858,7 +909,78 @@ async def retrieve(
     # Stash for verification step
     global _last_retrieve_context
     _last_retrieve_context = final_ctx
+
+    # Store in LRU cache
+    try:
+        _retrieve_cache[cache_key] = final_ctx
+        if len(_retrieve_cache) > _RETRIEVE_CACHE_CAPACITY:
+            # pop least-recently used item
+            _retrieve_cache.popitem(last=False)
+    except Exception:
+        pass
+
     return final_ctx
+
+
+async def draft_aha_in_chat(context: RunContext[RAGDeps], scope_text: str, target_activity: Optional[str] = None) -> str:
+    """Produce a chat-friendly AHA draft with citations inline."""
+    # Detect activities from scope
+    analysis = analyze_scope(scope_text)
+    activities = analysis.get("activities", [])
+    if not activities:
+        return "I couldn't detect activities in your scope. Can you add more detail (e.g., trenching depth, hot work, crane lifts)?"
+    activity = target_activity or activities[0]
+    aha = generate_full_aha(activity, context.deps.collection_name)
+    # Render a concise markdown draft
+    lines = [f"### AHA Draft – {aha.activity}"]
+    if aha.hazards:
+        lines.append("**Hazards:** " + ", ".join(aha.hazards))
+    lines.append("")
+    lines.append("**Work Sequence**")
+    for i, it in enumerate(aha.items, start=1):
+        lines.append(f"{i}. {it.step}")
+        if it.controls:
+            lines.append("   - Controls: " + "; ".join(it.controls[:4]))
+        if it.ppe:
+            lines.append("   - PPE: " + "; ".join(it.ppe[:4]))
+        if it.permits_training:
+            lines.append("   - Permits/Training: " + "; ".join(it.permits_training[:3]))
+    if aha.citations:
+        lines.append("")
+        lines.append("**Citations (EM 385)**")
+        for c in aha.citations[:5]:
+            pg = c.page_label or c.page_number or ""
+            lines.append(f"- § {c.section_path} (p. {pg}): \"{c.quote_anchor}\"")
+    lines.append("")
+    lines.append("Tell me what to adjust (e.g., add steps, tighten controls, change PPE).")
+    return "\n".join(lines)
+
+
+async def draft_csp_in_chat(context: RunContext[RAGDeps], scope_text: str) -> str:
+    """Produce a chat-friendly CSP outline with citations inline."""
+    import json
+    try:
+        spec = json.loads(scope_text)
+    except Exception:
+        spec = {
+            "project_name": "Project", "project_number": "", "location": "", "owner": "", "gc": "",
+            "work_packages": [], "deliverables": [], "assumptions": []
+        }
+    csp = generate_csp(spec, context.deps.collection_name)
+    lines = [f"### CSP Draft – {csp.project_name}"]
+    lines.append(f"Location: {csp.location} | Owner: {csp.owner} | GC: {csp.general_contractor}")
+    lines.append("")
+    for sec in csp.sections:
+        lines.append(f"#### {sec.name}")
+        for p in sec.paragraphs:
+            lines.append(f"- {p}")
+        if sec.citations:
+            for c in sec.citations[:2]:
+                pg = c.page_label or c.page_number or ""
+                lines.append(f"  - § {c.section_path} (p. {pg}): \"{c.quote_anchor}\"")
+        lines.append("")
+    lines.append("Tell me which sections to expand or revise.")
+    return "\n".join(lines)
 
 
 def _register_tools(agent_instance: Agent) -> None:
@@ -870,6 +992,73 @@ def _register_tools(agent_instance: Agent) -> None:
     agent_instance.tool(fall_anchor_design_load)
     agent_instance.tool(wind_speed_category)
     agent_instance.tool(machinery_impact_factor)
+    # Register builder tool (no decorator due to version compatibility)
+    agent_instance.tool(build_plan)
+    # Register chat-draft helpers
+    agent_instance.tool(draft_aha_in_chat)
+    agent_instance.tool(draft_csp_in_chat)
+
+from pydantic_ai import RunContext
+
+
+async def build_plan(context: RunContext[RAGDeps], scope_text_or_json: str, collection_name: Optional[str] = None) -> str:
+    """Build AHAs and CSP from a scope of work. Returns a summary with output file paths.
+
+    Provide the full scope as text or JSON.
+    """
+    coll = collection_name or context.deps.collection_name
+    # Analyze and generate AHAs
+    analysis = analyze_scope(scope_text_or_json)
+    acts = analysis.get('activities', [])
+    if not acts:
+        return "No activities detected in the provided scope. Please provide more details."
+    ahas = []
+    for a in acts:
+        try:
+            aha = generate_full_aha(a, coll)
+            ahas.append(aha)
+        except Exception as e:
+            print(f"[build_plan] AHA generation failed for {a}: {e}")
+    # Write AHA Book and per-activity files
+    book_docx = write_aha_book(ahas, 'outputs/AHA_Book.docx')
+    book_html = write_aha_book_html(ahas, 'outputs/AHA_Book.html')
+    book_md = write_aha_book_md(ahas, 'outputs/AHA_Book.md')
+    per_files: list[str] = []
+    for aha in ahas:
+        slug = aha.activity.lower().replace(' ', '_')
+        per_files.append(write_aha_single(aha, f'outputs/ahas/{slug}.docx'))
+        per_files.append(write_aha_single_html(aha, f'outputs/ahas/{slug}.html'))
+        per_files.append(write_aha_single_md(aha, f'outputs/ahas/{slug}.md'))
+
+    # Try to parse JSON for CSP header fields; fallback to generic
+    import json
+    try:
+        spec = json.loads(scope_text_or_json)
+    except Exception:
+        spec = {
+            "project_name": "Project",
+            "project_number": "",
+            "location": "",
+            "owner": "",
+            "gc": "",
+            "work_packages": [],
+            "deliverables": [],
+            "assumptions": [],
+        }
+
+    csp = generate_csp(spec, coll)
+    csp_docx = write_csp_docx(csp, 'outputs/CSP.docx')
+    csp_html = write_csp_html(csp, 'outputs/CSP.html')
+    csp_md = write_csp_md(csp, 'outputs/CSP.md')
+
+    summary = [
+        f"Activities detected: {', '.join(acts)}",
+        f"AHA Book: {book_docx} | {book_html} | {book_md}",
+        f"CSP: {csp_docx} | {csp_html} | {csp_md}",
+        "Per-activity AHA files:",
+        *[f"- {p}" for p in per_files],
+    ]
+    return "\n".join(summary)
 
 
 async def run_rag_agent(

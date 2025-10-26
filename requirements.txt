@@ -6,3 +6,4 @@ pydantic-ai==0.1.8
 openai>=1.50.0
 more-itertools>=10.0.0
 pint>=0.24.0
+firebase-admin>=6.5.0

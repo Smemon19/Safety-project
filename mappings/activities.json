@@ -1,0 +1,11 @@
+{
+  "Diving Operations": ["diving", "underwater", "subsea", "ROV"],
+  "Welding & Cutting": ["welding", "cutting", "hot work", "oxyfuel", "oxy-fuel"],
+  "Electrical Systems": ["electrical", "energized", "lockout", "tagout", "LOTO", "panel"],
+  "Excavation & Trenching": ["excavation", "trenching", "shoring", "shielding"],
+  "Cranes & Rigging": ["crane", "rigging", "hoist", "lift plan", "signalperson", "signaler"],
+  "Confined Space Entry": ["confined space", "permit-required confined space", "PRCS"],
+  "Demolition": ["demolition", "demo", "structure removal"]
+}
+
+

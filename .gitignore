@@ -126,3 +126,10 @@ chroma_db/
 chroma_db.zip
 chroma_db/
 docs/pdfs/*.pdf
+ 
+# Firebase service account (do not commit secrets)
+firebase-admin.json
+# App artifacts
+outputs/
+logs/
+uploads/

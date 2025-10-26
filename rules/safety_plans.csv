@@ -1,0 +1,5 @@
+plan_name,trigger_type,pattern,requires_aha_activity,requires_code
+Hot Work Plan,contains_text,hot work,,
+Confined Space Plan,aha_activity,Confined Space Entry,,
+Excavation Plan,code_present,385-1026,,
+

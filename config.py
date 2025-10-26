@@ -30,8 +30,8 @@ def _load_env_once() -> None:
     # Load from persisted appdata path first when available
     if _ENV_PATH:
         load_dotenv(dotenv_path=_ENV_PATH, override=False)
-    # Then load from repo-local .env if present (does not override existing)
-    load_dotenv(override=False)
+    # Then load from repo-local .env and allow it to override for local dev
+    load_dotenv(override=True)
 
 
 _load_env_once()

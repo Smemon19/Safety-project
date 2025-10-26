@@ -2,7 +2,7 @@
 
 import os
 import pathlib
-from typing import List, Dict, Any, Optional, Iterable, Set
+from typing import List, Dict, Any, Optional, Iterable, Set, Tuple
 
 import chromadb
 from more_itertools import batched
@@ -270,6 +270,7 @@ def make_chunk_metadata(
     section_path: str,
     headers: str,
     page_number: Optional[int],
+    page_label: Optional[str] = None,
     chunk_text: str,
     title: str,
     mime_type: str,
@@ -286,12 +287,16 @@ def make_chunk_metadata(
     word_count = len((chunk_text or "").split()) if chunk_text else 0
     content_preview = (chunk_text or "")[:180]
     chunk_id = compute_chunk_id(normalized_url, section_path or "", page_number, section_local_index)
+    # Build a short quote anchor to aid in precise citations
+    quote_anchor = extract_quote_anchor(chunk_text)
+
     meta: Dict[str, Any] = {
         "source_url": normalized_url,
         "source_type": source_type or "",
         "section_path": section_path or "",
         "headers": headers or "",
         "page_number": page_number if page_number is not None else "",
+        "page_label": page_label or "",
         "char_count": char_count,
         "word_count": word_count,
         "chunk_id": chunk_id,
@@ -301,12 +306,113 @@ def make_chunk_metadata(
         "embedding_model": embedding_model,
         "mime_type": mime_type or "",
         "title": title or "",
+        "quote_anchor": quote_anchor,
     }
     # Enforce namespace isolation in metadata if configured
     namespace_value = get_namespace()
     if namespace_value:
         meta["namespace"] = namespace_value
     return meta
+
+
+# ------------------------------
+# Metadata helpers for provenance
+# ------------------------------
+
+_SECTION_TOKEN_RE = re.compile(r"\b\d{3,4}(?:\.\d+)+\b")
+
+
+def detect_section_token(text: str) -> str:
+    """Return the first section-like token (e.g., 1507.9.6) found in text, else empty string.
+
+    This is useful for setting a best-effort section hint for PDF chunks lacking explicit headers.
+    """
+    if not text:
+        return ""
+    m = _SECTION_TOKEN_RE.search(text)
+    return m.group(0) if m else ""
+
+
+def _first_sentence(s: str, max_len: int) -> str:
+    # Split on common sentence terminators; keep it light-weight
+    for sep in [". ", "\n", "? ", "! "]:
+        idx = s.find(sep)
+        if 0 <= idx <= max_len:
+            return s[: idx + 1].strip()
+    return s[:max_len].strip()
+
+
+def extract_quote_anchor(chunk_text: str, max_len: int = 180) -> str:
+    """Extract a compact, human-quotable anchor from a chunk.
+
+    Preference order:
+    - The first sentence containing a section token (1507.x etc.) if present
+    - Otherwise the first sentence up to max_len
+    - Fallback to the first max_len characters
+    """
+    if not chunk_text:
+        return ""
+    text = chunk_text.strip()
+    # Attempt to find a sentence with a section token
+    tokens = list(_SECTION_TOKEN_RE.finditer(text))
+    if tokens:
+        pos = tokens[0].start()
+        # look back a bit to capture the sentence start
+        start = max(0, text.rfind(". ", 0, pos) + 2)
+        anchor = text[start : min(len(text), start + max_len)]
+        return _first_sentence(anchor, max_len)
+    # Fallback: first sentence or first max_len characters
+    return _first_sentence(text, max_len)
+
+
+# ------------------------------
+# Lightweight reranker (lexical/semantic heuristics)
+# ------------------------------
+
+def _tokenize_for_overlap(s: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9\.\-/]+", (s or "").lower())
+
+
+def _score_overlap(query: str, doc: str) -> float:
+    q_tokens = _tokenize_for_overlap(query)
+    d_tokens = _tokenize_for_overlap(doc)
+    if not q_tokens or not d_tokens:
+        return 0.0
+    q_set = set(q_tokens)
+    d_set = set(d_tokens)
+    base = len(q_set & d_set)
+    # Boost section-like tokens and salient numerics
+    boost = 0
+    for t in q_set & d_set:
+        if _SECTION_TOKEN_RE.fullmatch(t):
+            boost += 3
+        elif re.fullmatch(r"\d+(?:\.\d+)?\s*(?:lb|pounds|kn|kilonewtons|mph)", t):
+            boost += 2
+    return float(base + boost)
+
+
+def rerank_results(
+    query: str,
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    top_k: int,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+    """Rerank candidate results by lightweight lexical heuristics.
+
+    Returns the top_k triplets (ids, docs, metas) in sorted order.
+    """
+    scored = []
+    for i, (cid, d, m) in enumerate(zip(ids, docs, metas)):
+        score = _score_overlap(query, d)
+        # slight tie-breaker on earlier candidates
+        scored.append((score, -i, cid, d, m))
+    scored.sort(reverse=True)
+    top = scored[: max(1, top_k)]
+    out_ids = [t[2] for t in top]
+    out_docs = [t[3] for t in top]
+    out_metas = [t[4] for t in top]
+    return out_ids, out_docs, out_metas
 
 def get_default_collection_name() -> str:
     """Return the default ChromaDB collection name.
@@ -491,9 +597,18 @@ def query_collection(
     # Merge namespace filter if configured
     ns = get_namespace()
     final_where: Optional[Dict[str, Any]] = None
+    # Only apply namespace filter if the collection actually uses namespace metadata
+    apply_ns = False
     if ns:
+        try:
+            probe = collection.get(include=["metadatas"], limit=1, offset=0)
+            metas = probe.get("metadatas", []) or []
+            if metas and isinstance(metas[0], dict) and (metas[0] or {}).get("namespace") is not None:
+                apply_ns = True
+        except Exception:
+            apply_ns = False
+    if ns and apply_ns:
         final_where = dict(where or {})
-        # Chroma metadata equality filter
         final_where.update({"namespace": ns})
         print(f"[query] Applying namespace filter where namespace='{ns}'")
     else:
@@ -565,15 +680,24 @@ def keyword_search_collection(
 
     offset = 0
     ns = get_namespace()
+    has_ns = False
     if ns:
-        print(f"[keyword_scan] Restricting scan to namespace='{ns}'")
+        try:
+            probe = collection.get(include=["metadatas"], limit=1, offset=0)
+            metas = probe.get("metadatas", []) or []
+            if metas and isinstance(metas[0], dict) and (metas[0] or {}).get("namespace") is not None:
+                has_ns = True
+        except Exception:
+            has_ns = False
+        if has_ns:
+            print(f"[keyword_scan] Restricting scan to namespace='{ns}'")
     while offset < total and len(results_docs) < max_results:
         res = collection.get(include=["documents", "metadatas"], limit=min(batch_size, total - offset), offset=offset)
         docs = res.get("documents", [])
         metas = res.get("metadatas", [])
         ids = res.get("ids", [])
         for doc, meta, id_ in zip(docs, metas, ids):
-            if ns and (meta or {}).get("namespace") != ns:
+            if ns and has_ns and (meta or {}).get("namespace") != ns:
                 continue
             text = (doc or "").lower()
             if any(sub in text for sub in normalized):

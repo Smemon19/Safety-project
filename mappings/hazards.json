@@ -1,0 +1,11 @@
+{
+  "Diving Operations": ["Drowning", "Decompression sickness", "Entanglement"],
+  "Welding & Cutting": ["Burns", "Fumes", "Fire", "Eye injury"],
+  "Electrical Systems": ["Electrical shock", "Arc flash", "LOTO failure"],
+  "Excavation & Trenching": ["Cave-in", "Struck-by", "Hazardous atmosphere"],
+  "Cranes & Rigging": ["Crane tip-over", "Load drop", "Struck-by"],
+  "Confined Space Entry": ["Asphyxiation", "Toxic exposure", "Engulfment"],
+  "Demolition": ["Uncontrolled collapse", "Falling debris", "Dust"]
+}
+
+
