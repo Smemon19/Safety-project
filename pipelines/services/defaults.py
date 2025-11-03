@@ -43,6 +43,7 @@ from context.project_metadata_extractor import BANNED_SUBSTRINGS as METADATA_BAN
 from export.docx_writer import write_csp_docx
 from export.pdf_writer import write_csp_pdf
 from generators.csp import assemble_csp_doc, build_csp_sections
+from generators.section_orchestrator import SectionRunResult
 
 
 def _ensure_output_dir(base_dir: Path) -> None:
@@ -415,141 +416,96 @@ class DefaultProcessingEngine(ProcessingEngine):
         config: Dict[str, Any],
     ) -> ProcessingState:
         import asyncio
-        
+
         sub_plan_matrix = map_dfow_to_plans(ingestion.dfow or [], ingestion.hazards or [])
-        
-        # Check if we should use evidence-based generation
+        context_packs = build_context_packs(ingestion, metadata, sub_plan_matrix)
+
         collection_name = config.get("collection_name")
         use_evidence_based = config.get("use_evidence_based_generation", True)
-        
+
+        evidence_registry: Dict[str, List[Dict[str, Any]]] = {}
+        insufficient_tracker: Dict[str, List[str]] = {}
+        logs: List[str] = []
+
         if use_evidence_based and collection_name:
-            # Use evidence-based generation
             try:
                 from utils import get_chroma_client, get_default_chroma_dir
                 from generators.evidence_generator import EvidenceBasedSectionGenerator
-                
+                from generators.section_orchestrator import SectionOrchestrator
+
                 chroma_client = get_chroma_client(get_default_chroma_dir())
                 generator = EvidenceBasedSectionGenerator(
                     collection_name=collection_name,
                     chroma_client=chroma_client,
                 )
-                
-                # Build project context
-                project_context = {
-                    "dfow": ingestion.dfow or [],
-                    "hazards": ingestion.hazards or [],
-                    "project_name": metadata.data.get("project_name", ""),
-                    "location": metadata.data.get("location", ""),
-                    "owner": metadata.data.get("owner", ""),
-                }
-                
-                # Generate sections using evidence-based approach
-                from context.context_builder import SECTION_DEFINITIONS
-                from models.csp import CspSection, CspCitation
-                
-                evidence_sections = []
-                evidence_registry: Dict[str, List[Dict[str, Any]]] = {}
-                logs = [f"Using evidence-based generation for {len(SECTION_DEFINITIONS)} sections."]
 
-                async def generate_all_sections():
-                    generated = []
-                    success_count = 0
-                    for section_def in SECTION_DEFINITIONS:
-                        result = await generator.generate_section(
-                            section_def.identifier,
-                            project_context,
-                            section_def.em385_refs,
-                        )
+                async def _generate() -> List[SectionRunResult]:
+                    results: List[SectionRunResult] = []
+                    for definition in SECTION_DEFINITIONS:
+                        pack = context_packs.get(definition.identifier, {})
+                        pack.setdefault("title", definition.title)
+                        orchestrator = SectionOrchestrator(definition, generator)
+                        result = await orchestrator.run(pack)
+                        results.append(result)
+                    return results
 
-                        evidence_registry[section_def.identifier] = [
-                            {
-                                "chunk_id": ev.chunk_id,
-                                "source": ev.source,
-                                "page_ref": ev.page_ref,
-                                "section_ref": ev.section_ref,
-                                "text": ev.bullet_text,
-                            }
-                            for ev in result.evidence_bullets
-                        ]
-
-                        if result.has_insufficient_evidence:
-                            logs.append(f"⚠️ {section_def.title}: INSUFFICIENT EVIDENCE")
-                            generated.append(
-                                CspSection(
-                                    name=section_def.title,
-                                    paragraphs=["INSUFFICIENT EVIDENCE"],
-                                    citations=[],
-                                )
-                            )
-                            continue
-
-                        # Convert to CspSection
-                        paragraphs = result.section_text.split("\n\n")
-                        citations = [
-                            CspCitation(
-                                section_path=cit.get("section_path", ""),
-                                page_label=cit.get("page_label", ""),
-                                source_url=cit.get("source_url", ""),
-                                quote_anchor=cit.get("chunk_id", ""),
-                            )
-                            for cit in result.citations
-                        ]
-
-                        generated.append(CspSection(
-                            name=section_def.title,
-                            paragraphs=paragraphs,
-                            citations=citations,
-                        ))
-
-                        success_count += 1
-
-                        logs.append(
-                            f"✅ {section_def.title}: {len(result.evidence_bullets)} evidence bullets, "
-                            f"{result.contamination_removed} contaminated sentences removed"
-                        )
-
-                    logs.append(f"Evidence-based generation completed with {success_count} section(s) composed.")
-                    return generated
-
-                # Run async generation
                 try:
                     loop = asyncio.get_event_loop()
                 except RuntimeError:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                
-                evidence_sections = loop.run_until_complete(generate_all_sections())
-                
-                context_packs = build_context_packs(ingestion, metadata, sub_plan_matrix)
-                csp_sections = evidence_sections or []
-                logs.append(f"Generated {len(evidence_sections)} evidence-based sections (including insufficient placeholders).")
-            except Exception as e:
-                # Fallback to template-based on error
-                logs.append(f"Evidence-based generation failed: {e}. Using template-based fallback.")
-                context_packs = build_context_packs(ingestion, metadata, sub_plan_matrix)
-                csp_sections = build_csp_sections(context_packs)
-        else:
-            # Template-based (legacy)
-            context_packs = build_context_packs(ingestion, metadata, sub_plan_matrix)
-            csp_sections = build_csp_sections(context_packs)
-            logs = [
+
+                run_results = loop.run_until_complete(_generate())
+                sections = [result.section for result in run_results]
+
+                for definition, result in zip(SECTION_DEFINITIONS, run_results):
+                    evidence_registry[definition.identifier] = result.evidence_entries
+                    if result.insufficient_reasons:
+                        insufficient_tracker[definition.identifier] = result.insufficient_reasons
+                        logs.append(
+                            f"⚠️ {definition.title}: " + "; ".join(result.insufficient_reasons)
+                        )
+                    else:
+                        logs.append(f"✅ {definition.title}: evidence packet ready")
+
+                pending_plans = sum(
+                    1 for details in sub_plan_matrix.values() if details.get("status") != "Not Applicable"
+                )
+                logs.append(
+                    f"Evidence orchestration completed for {len(sections)} section(s); {pending_plans} plan(s) pending."
+                )
+
+                manifest_fragments: Dict[str, Any] = {
+                    "evidence": evidence_registry,
+                    "insufficient": insufficient_tracker,
+                }
+
+                return ProcessingState(
+                    context_packs=context_packs,
+                    sections=sections,
+                    sub_plan_matrix=sub_plan_matrix,
+                    manifest_fragments=manifest_fragments,
+                    logs=logs,
+                )
+            except Exception as exc:
+                logs.append(f"Evidence orchestration failed: {exc}. Using context-only sections.")
+
+        logs.extend(
+            [
                 f"Detected {len(ingestion.dfow or [])} definable feature(s) of work.",
                 f"Sub-plan applicability matrix generated for {len(sub_plan_matrix)} plan(s).",
                 f"Assembled context packs for {len(context_packs)} CSP section(s).",
             ]
-        
+        )
         pending_plans = sum(1 for details in sub_plan_matrix.values() if details.get("status") != "Not Applicable")
         logs.append(f"{pending_plans} plan(s) require review or development.")
-        
-        manifest_fragments = {}
-        if 'evidence_registry' in locals():
-            manifest_fragments["evidence"] = evidence_registry
 
+        sections = build_csp_sections(context_packs)
         return ProcessingState(
-            context_packs=context_packs if 'context_packs' in locals() else build_context_packs(ingestion, metadata, sub_plan_matrix),
-            sections=csp_sections,
+            context_packs=context_packs,
+            sections=sections,
             sub_plan_matrix=sub_plan_matrix,
-            manifest_fragments=manifest_fragments,
+            manifest_fragments={},
             logs=logs,
         )
 
@@ -597,6 +553,12 @@ class DefaultValidator(CSPValidator):
             issues.append(("title block", f"placeholder for {field}", "Provide verified value"))
 
         evidence_map = processing.manifest_fragments.get("evidence", {}) if processing.manifest_fragments else {}
+        insufficient_map = processing.manifest_fragments.get("insufficient", {}) if processing.manifest_fragments else {}
+
+        for identifier, reasons in insufficient_map.items():
+            title = next((d.title for d in SECTION_DEFINITIONS if d.identifier == identifier), identifier)
+            joined = "; ".join(reasons)
+            issues.append((title, f"insufficient evidence: {joined}", "Collect required project and EM 385 snippets"))
 
         # Section level validation
         for section in processing.sections or []:
@@ -606,9 +568,6 @@ class DefaultValidator(CSPValidator):
                 phrases = ", ".join(sorted({token for token, _ in tokens}))
                 issues.append((section.name, f"unresolved token(s): {phrases}", "Replace placeholder markers"))
 
-            if "INSUFFICIENT EVIDENCE" in combined_text:
-                issues.append((section.name, "insufficient evidence", "Meet extractive quota (≥3 snippets)"))
-
             banned_detected = detect_contamination(combined_text)
             if banned_detected:
                 phrases = ", ".join(sorted(set(banned_detected)))
@@ -617,27 +576,47 @@ class DefaultValidator(CSPValidator):
             if any(contains_placeholder(par) for par in section.paragraphs):
                 issues.append((section.name, "placeholder text detected", "Write from evidence"))
 
-            citation_count = len(section.citations or [])
-            if citation_count < 3:
-                issues.append((section.name, f"only {citation_count} citation(s)", "Extract at least 3 supporting snippets"))
-
             identifier = expected_titles.get(section.name)
-            evidence_entries = evidence_map.get(identifier, []) if identifier else []
-            if len(evidence_entries) < 3:
-                issues.append((section.name, f"only {len(evidence_entries)} evidence snippet(s)", "Meet extractive quota (≥3 snippets)"))
-            else:
-                project_supported = [
-                    entry
-                    for entry in evidence_entries
-                    if "em 385" not in str(entry.get("source", "")).lower()
-                ]
-                if len(project_supported) < 2:
-                    issues.append((section.name, "insufficient project evidence", "Collect ≥2 project-grounded snippets"))
+            definition = next((d for d in SECTION_DEFINITIONS if d.identifier == identifier), None)
+            packet = getattr(section, "context_packet", None)
 
-            if re.search(r"EM\s*385-1-1\s+§\d(?!\d)", combined_text):
-                issues.append((section.name, "unnormalized EM 385 citation", "Normalize to §XX.XX format"))
-            if re.search(r"§\d(?!\d)", combined_text):
-                issues.append((section.name, "invalid citation token", "Use §XX.XX or §XX.A.XX format"))
+            if not definition:
+                issues.append((section.name, "unknown section", "Ensure section definition is registered"))
+                continue
+
+            if packet is None:
+                issues.append((section.name, "context packet missing", "Re-run evidence orchestrator"))
+                continue
+
+            project_evidence = packet.project_evidence or []
+            em_evidence = packet.em385_evidence or []
+
+            if len(project_evidence) < definition.project_evidence_quota:
+                issues.append(
+                    (
+                        section.name,
+                        f"{len(project_evidence)} project snippets (need ≥{definition.project_evidence_quota})",
+                        "Collect additional project-grounded evidence",
+                    )
+                )
+            if len(em_evidence) < definition.em_evidence_quota:
+                issues.append(
+                    (
+                        section.name,
+                        f"{len(em_evidence)} EM 385 snippets (need ≥{definition.em_evidence_quota})",
+                        "Retrieve specific EM 385 clauses",
+                    )
+                )
+
+            selection = packet.selection_plan or {}
+            if not selection.get("project") or not selection.get("em385"):
+                issues.append(
+                    (
+                        section.name,
+                        "selection plan incomplete",
+                        "Ensure Step A lists project and EM 385 bullets",
+                    )
+                )
 
         # Consolidate issues into single error string
         errors: List[str] = []

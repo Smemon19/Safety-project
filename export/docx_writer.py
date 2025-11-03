@@ -29,7 +29,7 @@ def _add_cover_page(doc: Document, csp: CspDoc) -> None:
     from datetime import datetime
     doc.add_heading('Comprehensive Site-Specific Construction Safety and Health Plan', level=0)
     doc.add_paragraph()  # Spacing
-    
+
     # Title block fields (fail if missing per validation)
     _add_paragraph_with_placeholders(doc, f"Project: {csp.project_name or '[Insert Project Name]'}")
     if csp.project_number:
@@ -39,24 +39,13 @@ def _add_cover_page(doc: Document, csp: CspDoc) -> None:
         _add_paragraph_with_placeholders(doc, f"Owner: {csp.owner}")
     if csp.general_contractor:
         _add_paragraph_with_placeholders(doc, f"Prime Contractor: {csp.general_contractor}")
-    
+
     doc.add_paragraph()  # Spacing
-    
-    # Document metadata
-    _add_paragraph_with_placeholders(doc, "Prepared for submission to the U.S. Army Corps of Engineers")
+
     doc.add_paragraph(f"Document ID: CSP-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
     doc.add_paragraph(f"Version: 1.0")
     doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    doc.add_page_break()
 
-
-def _add_toc_placeholder(doc: Document) -> None:
-    doc.add_heading('Table of Contents', level=1)
-    _add_paragraph_with_placeholders(
-        doc,
-        'Update the Table of Contents in Word after opening this document (References > Table of Contents > Update).'
-    )
     doc.add_page_break()
 
 
@@ -208,7 +197,6 @@ def write_csp_docx(csp: CspDoc, output_path: str) -> str:
         pass
 
     _add_cover_page(doc, csp)
-    _add_toc_placeholder(doc)
     _add_revision_log(doc)
 
     for idx, sec in enumerate(csp.sections):
