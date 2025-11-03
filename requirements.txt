@@ -7,3 +7,11 @@ openai>=1.50.0
 more-itertools>=10.0.0
 pint>=0.24.0
 firebase-admin>=6.5.0
+# DOCX support for reading uploads and writing outputs
+python-docx>=0.8.11
+# PDF ingestion & OCR
+pymupdf>=1.24.9
+pillow>=10.3.0
+pytesseract>=0.3.10
+tiktoken>=0.7.0
+reportlab>=4.2.0

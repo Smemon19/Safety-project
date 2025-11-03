@@ -1,11 +1,22 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 from pathlib import Path
 from html import escape
 from models.aha import AhaDoc
 from models.csp import CspDoc
-from generators.csp import SECTION_MAP
+
+
+SECTION_CROSSWALK: Dict[str, str] = {
+    # Legacy mapping retained for cross-reference table when available.
+    "Diving Program": "Diving Operations",
+    "Welding & Cutting Program": "Welding & Cutting",
+    "Electrical Safety & LOTO": "Electrical Systems",
+    "Excavation & Trenching Safety": "Excavation & Trenching",
+    "Cranes & Rigging": "Cranes & Rigging",
+    "Confined Space Program": "Confined Space Entry",
+    "Demolition Plan": "Demolition",
+}
 
 
 def write_aha_book_html(docs: List[AhaDoc], output_path: str) -> str:
@@ -77,7 +88,7 @@ def write_csp_html(csp: CspDoc, output_path: str) -> str:
 
     # Crosswalk (Section -> AHA link)
     try:
-        rev = {v: k for k, v in SECTION_MAP.items()}
+        rev = {v: k for k, v in SECTION_CROSSWALK.items()}
         parts.append("<h2>AHA Crosswalk</h2>")
         parts.append("<table><thead><tr><th>CSP Section</th><th>AHA</th><th>Link</th></tr></thead><tbody>")
         for sec in csp.sections:

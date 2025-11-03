@@ -1,0 +1,108 @@
+[
+  {
+    "name": "Fall Protection and Prevention Plan",
+    "em385_refs": ["§21-7.a"],
+    "dfow_keywords": ["fall", "roof", "steel", "scaffold", "tower", "ladder", "elevated"],
+    "hazard_keywords": ["fall", "elevation", "unprotected edge", "leading edge"],
+    "always_required": false
+  },
+  {
+    "name": "Rescue Plan",
+    "em385_refs": ["§21-7.b"],
+    "dfow_keywords": ["confined space", "tower", "vertical", "climbing"],
+    "hazard_keywords": ["rescue", "retrieval", "suspension"],
+    "always_required": false
+  },
+  {
+    "name": "Scaffolding Work Plan",
+    "em385_refs": ["§22-7"],
+    "dfow_keywords": ["scaffold", "scaffolding", "suspended platform"],
+    "hazard_keywords": ["scaffold", "platform collapse"],
+    "always_required": false
+  },
+  {
+    "name": "Confined Space Plan",
+    "em385_refs": ["§34-7.b"],
+    "dfow_keywords": ["confined space", "tank", "vault", "manhole", "tunnel"],
+    "hazard_keywords": ["confined space", "oxygen deficiency", "toxic atmosphere"],
+    "always_required": false
+  },
+  {
+    "name": "Excavation and Trenching Plan",
+    "em385_refs": ["§25-7"],
+    "dfow_keywords": ["excavation", "trench", "earthwork", "shoring"],
+    "hazard_keywords": ["cave-in", "trench", "shoring"],
+    "always_required": false
+  },
+  {
+    "name": "Demolition Plan",
+    "em385_refs": ["§17-7"],
+    "dfow_keywords": ["demolition", "structure removal"],
+    "hazard_keywords": ["demolition", "implosion"],
+    "always_required": false
+  },
+  {
+    "name": "Fire Prevention Plan",
+    "em385_refs": ["§9-7"],
+    "dfow_keywords": ["hot work", "welding", "cutting"],
+    "hazard_keywords": ["fire", "hot work", "combustible"],
+    "always_required": true
+  },
+  {
+    "name": "Electrical Safety / Energy Control Plan",
+    "em385_refs": ["§11-7", "§12-7"],
+    "dfow_keywords": ["electrical", "energized", "loto", "temporary power"],
+    "hazard_keywords": ["electrical", "arc flash", "lockout"],
+    "always_required": true
+  },
+  {
+    "name": "Traffic Control Plan",
+    "em385_refs": ["§8-7"],
+    "dfow_keywords": ["traffic", "roadway", "vehicle", "hauling"],
+    "hazard_keywords": ["traffic", "vehicle impact", "flagging"],
+    "always_required": false
+  },
+  {
+    "name": "Silica Compliance Plan",
+    "em385_refs": ["§6-7.j"],
+    "dfow_keywords": ["concrete", "cutting", "masonry", "grinding"],
+    "hazard_keywords": ["silica", "dust", "respirable"],
+    "always_required": false
+  },
+  {
+    "name": "Hearing Conservation Plan",
+    "em385_refs": ["§5-7.a"],
+    "dfow_keywords": ["pile driving", "demolition", "drilling"],
+    "hazard_keywords": ["noise", "hearing"],
+    "always_required": true
+  },
+  {
+    "name": "Respiratory Protection Plan",
+    "em385_refs": ["§5-7.b"],
+    "dfow_keywords": ["painting", "coating", "abrasive blasting", "chemical handling"],
+    "hazard_keywords": ["respiratory", "air monitoring", "vapors"],
+    "always_required": false
+  },
+  {
+    "name": "Emergency Response Plan",
+    "em385_refs": ["§36-7.c"],
+    "dfow_keywords": ["emergency", "hazmat", "medical"],
+    "hazard_keywords": ["emergency", "evacuation", "severe weather"],
+    "always_required": true
+  },
+  {
+    "name": "Housekeeping Plan",
+    "em385_refs": ["§10-7"],
+    "dfow_keywords": ["housekeeping", "cleanup", "waste"],
+    "hazard_keywords": ["debris", "slip"],
+    "always_required": true
+  },
+  {
+    "name": "Site Layout Plan",
+    "em385_refs": ["§28-7.b"],
+    "dfow_keywords": ["site layout", "staging", "laydown", "logistics"],
+    "hazard_keywords": ["traffic", "material storage", "logistics"],
+    "always_required": true
+  }
+]
+

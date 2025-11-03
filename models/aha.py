@@ -26,5 +26,6 @@ class AhaDoc(BaseModel):
     hazards: List[str]
     items: List[AhaItem]
     citations: List[AhaCitation]
+    codes_covered: List[str] = []
 
 
