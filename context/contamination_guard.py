@@ -9,6 +9,11 @@ from collections import Counter
 
 # Banned phrases that indicate generic filler or template content
 BANNED_PHRASES = [
+    r"(?i)table\s+of\s+contents",
+    r"(?i)for\s+receipt\s+by\s+the\s+contracting\s+officer",
+    r"(?i)quality\s+control\s+approval\.\s+submit\s+the\s+following",
+    r"(?i)add\s+absorbent\s+material\s+to\s+absorb\s+residue\s+oil",
+    r"(?i)update\s+the\s+table\s+of\s+contents",
     r"(?i)\bllm\s+guidance\b",
     r"(?i)\bbest\s+practice\s+recommendations\b",
     r"(?i)\bbased\s+on\s+industry\s+standards\b",

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from context.section_retriever import SectionScopedRetriever, EvidenceChunk
 from context.contamination_guard import filter_contaminated_content, BANNED_PHRASES
+from generators.csp import _normalize_em_ref
 
 
 @dataclass
@@ -67,18 +68,14 @@ class EvidenceBasedSectionGenerator:
             top_k=self.max_evidence_count,
         )
         
-        if len(evidence_chunks) < self.min_evidence_count:
-            # Return what we have, but mark as insufficient
-            pass
-        
         # Extract verbatim bullets from chunks
         extracted: List[ExtractedEvidence] = []
         seen_bullets = set()
-        
+
         for chunk in evidence_chunks[:self.max_evidence_count]:
             # Extract key sentences/statements from chunk
             sentences = self._extract_key_sentences(chunk.text)
-            
+
             for sentence in sentences:
                 # Normalize and check for duplicates
                 normalized = self._normalize_text(sentence)
@@ -93,19 +90,21 @@ class EvidenceBasedSectionGenerator:
                 elif chunk.page_number:
                     page_ref = f"page {chunk.page_number}"
                 
+                words = sentence.strip().split()
+                trimmed_sentence = " ".join(words[:40])
                 extracted.append(
                     ExtractedEvidence(
                         chunk_id=chunk.chunk_id,
-                        bullet_text=sentence.strip(),
+                        bullet_text=trimmed_sentence,
                         source=chunk.source,
                         page_ref=page_ref,
                         section_ref=chunk.section_path,
                     )
                 )
-                
+
                 if len(extracted) >= self.max_evidence_count:
                     break
-            
+
             if len(extracted) >= self.max_evidence_count:
                 break
         
@@ -131,7 +130,9 @@ class EvidenceBasedSectionGenerator:
             ]
             is_generic = any(re.match(p, sentence.lower()) for p in generic_patterns)
             
-            if not is_generic and len(sentence) >= 20 and len(sentence) <= 300:
+            if not is_generic and len(sentence) >= 20 and len(sentence.split()) <= 50:
+                if any(re.search(pattern, sentence, re.IGNORECASE) for pattern in BANNED_PHRASES):
+                    continue
                 key_sentences.append(sentence)
         
         # Return top sentences (prioritize longer, more specific ones)
@@ -165,102 +166,76 @@ class EvidenceBasedSectionGenerator:
         """
         if len(evidence_bullets) < self.min_evidence_count:
             return "INSUFFICIENT EVIDENCE"
-        
-        # Get section definition
-        from context.context_builder import SECTION_DEFINITIONS
-        section_def = next(
-            (s for s in SECTION_DEFINITIONS if s.identifier == section_identifier),
-            None
-        )
-        if not section_def:
+
+        if not os.getenv("OPENAI_API_KEY"):
             return "INSUFFICIENT EVIDENCE"
-        
-        # Build evidence text with chunk IDs
-        evidence_text = "\n".join(
-            f"• [{e.chunk_id}] {e.bullet_text}" +
-            (f" (from {e.source}" if e.source else "") +
-            (f", {e.page_ref}" if e.page_ref else "") +
-            (f", {e.section_ref}" if e.section_ref else "") +
-            (")" if e.source else "")
-            for e in evidence_bullets
-        )
-        
-        em385_text = ", ".join(em385_refs) if em385_refs else "relevant sections"
-        
-        # Try LLM-based composition with controlled parameters
-        try:
-            from pydantic_ai import Agent
-            from pydantic_ai.models.openai import OpenAIModel
-            import openai
-            
-            model_name = os.getenv("OPENAI_API_MODEL", "gpt-4o-mini")
-            
-            # Build prompt
-            prompt = f"""Compose a CSP section for "{section_def.title}" based ONLY on the following evidence and EM 385-1-1 requirements.
 
-Evidence (use verbatim where possible):
-{evidence_text}
-
-EM 385-1-1 References: {em385_text}
-
-Requirements:
-1. Write in standard CSP format: Purpose, Procedures/Policy/Requirements, Responsibilities, Forms/Logs/Records
-2. Use ONLY information from the evidence above - cite chunk IDs [chunk_id] where used
-3. Include specific details from the evidence
-4. Reference EM 385 sections where applicable
-5. Cite sources using format: (source, page X) or (EM 385-1-1 §XX.YY)
-6. NO generic filler, templates, or LLM guidance phrases
-7. If there's insufficient specific information, write "INSUFFICIENT EVIDENCE" instead of generic text
-
-Output the section text:"""
-            
-            # Use OpenAI directly with controlled parameters
-            client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "You are a CSP generator that writes sections based ONLY on provided evidence. Never add generic filler or templates."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.25,  # Low temperature for factual content
-                top_p=0.9,
-                stop=[
-                    "\n\nThis document",
-                    "\n\nNote:",
-                    "\n\nDisclaimer:",
-                    "\n\nFor more information",
-                    "\n\nLLM guidance",
-                    "\n\nbest practice",
-                ],
-                max_tokens=2000,
-            )
-            
-            composed = response.choices[0].message.content.strip()
-            return composed
-            
-        except Exception as e:
-            # Fallback to simple composition
-            return self._simple_compose(evidence_bullets, em385_refs)
-    
-    def _simple_compose(self, evidence_bullets: List[ExtractedEvidence], em385_refs: List[str]) -> str:
-        """Simple composition fallback."""
-        paragraphs = [
-            "Purpose: (Derived from evidence)",
-            "Procedures / Policy / Requirements:",
+        project_supported = [
+            ev for ev in evidence_bullets if not self._is_em385_source(ev.source)
         ]
-        
-        for evidence in evidence_bullets[:4]:  # Use top 4
-            paragraphs.append(f"- {evidence.bullet_text}")
-            if evidence.page_ref:
-                paragraphs[-1] += f" ({evidence.source}, {evidence.page_ref})"
-        
-        paragraphs.append(
-            f"References: EM 385-1-1 {', '.join(em385_refs) if em385_refs else 'relevant sections'}."
-        )
-        
+        if len(project_supported) < 2:
+            return "INSUFFICIENT EVIDENCE"
+
+        paragraphs = self._compose_structured_paragraphs(evidence_bullets, em385_refs)
         return "\n\n".join(paragraphs)
-    
+
+    def _simple_compose(self, evidence_bullets: List[ExtractedEvidence], em385_refs: List[str]) -> str:
+        """Legacy helper retained for compatibility (unused)."""
+        return "INSUFFICIENT EVIDENCE"
+
+    def _compose_structured_paragraphs(
+        self,
+        evidence_bullets: List[ExtractedEvidence],
+        em385_refs: List[str],
+    ) -> List[str]:
+        def fmt(ev: ExtractedEvidence) -> str:
+            citation = f" [{ev.chunk_id}]"
+            if ev.page_ref:
+                citation += f" ({ev.page_ref})"
+            return f"{ev.bullet_text}{citation}"
+
+        paragraphs: List[str] = []
+        paragraphs.append(f"Purpose: {fmt(evidence_bullets[0])}")
+
+        procedure_evidence = evidence_bullets[1:3]
+        if procedure_evidence:
+            paragraphs.append(
+                "Procedures / Policy / Requirements: "
+                + " ".join(fmt(ev) for ev in procedure_evidence)
+            )
+
+        responsibility_evidence = evidence_bullets[3:5]
+        if responsibility_evidence:
+            paragraphs.append(
+                "Responsibilities: " + " ".join(fmt(ev) for ev in responsibility_evidence)
+            )
+
+        remaining = evidence_bullets[5:]
+        if remaining:
+            paragraphs.append(
+                "Forms, Logs, or Records: " + " ".join(fmt(ev) for ev in remaining)
+            )
+
+        normalized_refs = []
+        seen_refs = set()
+        for ref in em385_refs:
+            norm = _normalize_em_ref(ref)
+            if norm and norm not in seen_refs:
+                seen_refs.add(norm)
+                normalized_refs.append(norm)
+            if len(normalized_refs) >= 5:
+                break
+
+        em_text = ", ".join(normalized_refs) if normalized_refs else "relevant EM 385 clauses"
+        chunk_refs = ", ".join(ev.chunk_id for ev in evidence_bullets)
+        paragraphs.append(f"References: EM 385-1-1 {em_text}; Evidence: {chunk_refs}.")
+        return paragraphs
+
+    def _is_em385_source(self, source: Optional[str]) -> bool:
+        if not source:
+            return False
+        return "em 385" in source.lower()
+
     async def generate_section(
         self,
         section_identifier: str,
@@ -278,7 +253,18 @@ Output the section text:"""
                 citations=[],
                 has_insufficient_evidence=True,
             )
-        
+
+        project_supported = [
+            ev for ev in evidence_bullets if not self._is_em385_source(ev.source)
+        ]
+        if len(project_supported) < 2:
+            return SectionGenerationResult(
+                section_text="INSUFFICIENT EVIDENCE",
+                evidence_bullets=evidence_bullets,
+                citations=[],
+                has_insufficient_evidence=True,
+            )
+
         # Step B: Compose from evidence
         composed_text = await self.compose_section(
             section_identifier,
@@ -286,10 +272,30 @@ Output the section text:"""
             project_context,
             em385_refs,
         )
-        
+
+        if composed_text.strip() == "INSUFFICIENT EVIDENCE":
+            return SectionGenerationResult(
+                section_text="INSUFFICIENT EVIDENCE",
+                evidence_bullets=evidence_bullets,
+                citations=[],
+                has_insufficient_evidence=True,
+            )
+
         # Apply contamination guard
-        cleaned_text, contamination_count = filter_contaminated_content(composed_text)
-        
+        evidence_texts = [ev.bullet_text for ev in evidence_bullets]
+        cleaned_text, contamination_count = filter_contaminated_content(
+            composed_text, evidence_texts=evidence_texts
+        )
+
+        if not cleaned_text:
+            return SectionGenerationResult(
+                section_text="INSUFFICIENT EVIDENCE",
+                evidence_bullets=evidence_bullets,
+                citations=[],
+                has_insufficient_evidence=True,
+                contamination_removed=contamination_count,
+            )
+
         # Build citations
         citations = []
         for evidence in evidence_bullets:
@@ -297,8 +303,9 @@ Output the section text:"""
                 "section_path": evidence.section_ref or "",
                 "page_label": evidence.page_ref or "",
                 "source_url": evidence.source,
+                "chunk_id": evidence.chunk_id,
             })
-        
+
         return SectionGenerationResult(
             section_text=cleaned_text,
             evidence_bullets=evidence_bullets,

@@ -10,6 +10,7 @@ management, context pack creation, and export features are implemented.
 """
 
 import json
+import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,7 @@ from context.context_builder import SECTION_DEFINITIONS, build_context_packs
 from context.document_ingestion import DocumentIngestionEngine
 from context.dfow_mapping import map_dfow_to_plans
 from context.placeholder_manager import format_placeholder, contains_placeholder
+from context.project_metadata_extractor import BANNED_SUBSTRINGS as METADATA_BANNED
 from export.docx_writer import write_csp_docx
 from export.pdf_writer import write_csp_pdf
 from generators.csp import assemble_csp_doc, build_csp_sections
@@ -446,22 +448,41 @@ class DefaultProcessingEngine(ProcessingEngine):
                 from models.csp import CspSection, CspCitation
                 
                 evidence_sections = []
+                evidence_registry: Dict[str, List[Dict[str, Any]]] = {}
                 logs = [f"Using evidence-based generation for {len(SECTION_DEFINITIONS)} sections."]
-                
+
                 async def generate_all_sections():
                     generated = []
+                    success_count = 0
                     for section_def in SECTION_DEFINITIONS:
                         result = await generator.generate_section(
                             section_def.identifier,
                             project_context,
                             section_def.em385_refs,
                         )
-                        
+
+                        evidence_registry[section_def.identifier] = [
+                            {
+                                "chunk_id": ev.chunk_id,
+                                "source": ev.source,
+                                "page_ref": ev.page_ref,
+                                "section_ref": ev.section_ref,
+                                "text": ev.bullet_text,
+                            }
+                            for ev in result.evidence_bullets
+                        ]
+
                         if result.has_insufficient_evidence:
                             logs.append(f"⚠️ {section_def.title}: INSUFFICIENT EVIDENCE")
-                            # Fallback to template-based for this section
+                            generated.append(
+                                CspSection(
+                                    name=section_def.title,
+                                    paragraphs=["INSUFFICIENT EVIDENCE"],
+                                    citations=[],
+                                )
+                            )
                             continue
-                        
+
                         # Convert to CspSection
                         paragraphs = result.section_text.split("\n\n")
                         citations = [
@@ -469,23 +490,27 @@ class DefaultProcessingEngine(ProcessingEngine):
                                 section_path=cit.get("section_path", ""),
                                 page_label=cit.get("page_label", ""),
                                 source_url=cit.get("source_url", ""),
+                                quote_anchor=cit.get("chunk_id", ""),
                             )
                             for cit in result.citations
                         ]
-                        
+
                         generated.append(CspSection(
                             name=section_def.title,
                             paragraphs=paragraphs,
                             citations=citations,
                         ))
-                        
+
+                        success_count += 1
+
                         logs.append(
                             f"✅ {section_def.title}: {len(result.evidence_bullets)} evidence bullets, "
                             f"{result.contamination_removed} contaminated sentences removed"
                         )
-                    
+
+                    logs.append(f"Evidence-based generation completed with {success_count} section(s) composed.")
                     return generated
-                
+
                 # Run async generation
                 try:
                     loop = asyncio.get_event_loop()
@@ -495,17 +520,9 @@ class DefaultProcessingEngine(ProcessingEngine):
                 
                 evidence_sections = loop.run_until_complete(generate_all_sections())
                 
-                # Build context packs for remaining sections (for compatibility)
                 context_packs = build_context_packs(ingestion, metadata, sub_plan_matrix)
-                
-                # Use evidence sections if we got any, otherwise fall back
-                if evidence_sections:
-                    csp_sections = evidence_sections
-                    logs.append(f"Generated {len(evidence_sections)} evidence-based sections.")
-                else:
-                    # Fallback to template-based
-                    logs.append("Falling back to template-based generation.")
-                    csp_sections = build_csp_sections(context_packs)
+                csp_sections = evidence_sections or []
+                logs.append(f"Generated {len(evidence_sections)} evidence-based sections (including insufficient placeholders).")
             except Exception as e:
                 # Fallback to template-based on error
                 logs.append(f"Evidence-based generation failed: {e}. Using template-based fallback.")
@@ -524,142 +541,115 @@ class DefaultProcessingEngine(ProcessingEngine):
         pending_plans = sum(1 for details in sub_plan_matrix.values() if details.get("status") != "Not Applicable")
         logs.append(f"{pending_plans} plan(s) require review or development.")
         
+        manifest_fragments = {}
+        if 'evidence_registry' in locals():
+            manifest_fragments["evidence"] = evidence_registry
+
         return ProcessingState(
             context_packs=context_packs if 'context_packs' in locals() else build_context_packs(ingestion, metadata, sub_plan_matrix),
             sections=csp_sections,
             sub_plan_matrix=sub_plan_matrix,
-            manifest_fragments={},
+            manifest_fragments=manifest_fragments,
             logs=logs,
         )
 
 
 class DefaultValidator(CSPValidator):
-    """Permissive validator until full validation rules are implemented."""
+    """Strict validator enforcing contamination and evidence requirements."""
 
     def validate(
         self,
         metadata: MetadataState,
         processing: ProcessingState,
     ) -> ValidationState:
-        errors: List[str] = []
-        warnings: List[str] = []
-
-        missing_required = [
-            field for field, placeholder in metadata.placeholders.items() if placeholder
-        ]
-        if missing_required:
-            warnings.append(
-                "Required metadata fields rely on placeholders: " + ", ".join(missing_required)
-            )
-
-        expected_titles = {definition.title for definition in SECTION_DEFINITIONS}
-        produced_titles = {section.name for section in (processing.sections or [])}
-        missing_sections = sorted(expected_titles - produced_titles)
-        if missing_sections:
-            errors.append("Missing CSP sections: " + ", ".join(missing_sections))
-
-        name_to_identifier = {definition.title: definition.identifier for definition in SECTION_DEFINITIONS}
-
-        # Fail-fast: scan for unresolved placeholders/tokens
         from context.placeholder_manager import find_unresolved_tokens
-        unresolved_tokens_by_section: Dict[str, List[Tuple[str, int]]] = {}
-        total_unresolved = 0
-        
+        from context.contamination_guard import detect_contamination
+
+        issues: List[Tuple[str, str, str]] = []
+
+        expected_titles = {definition.title: definition.identifier for definition in SECTION_DEFINITIONS}
+        produced_titles = {section.name for section in (processing.sections or [])}
+        for missing in sorted(set(expected_titles.keys()) - produced_titles):
+            issues.append((missing, "section missing", "Generate all 13 CSP sections"))
+
+        # Title block checks
+        title_fields = {
+            "project": "project_name",
+            "project number": "project_number",
+            "location": "location",
+            "owner": "owner",
+            "prime contractor": "prime_contractor",
+        }
+        for label, key in title_fields.items():
+            value = str(metadata.data.get(key, "")).strip()
+            if not value:
+                issues.append(("title block", f"{label} missing", "Populate metadata from cover page"))
+                continue
+            if contains_placeholder(value):
+                issues.append(("title block", f"{label} placeholder", "Resolve placeholders before export"))
+                continue
+            lower_value = value.lower()
+            if any(term in lower_value for term in METADATA_BANNED):
+                issues.append(("title block", f"{label} contains '{value}'", "TOC leakage—sanitize before indexing"))
+
+        # Metadata placeholders
+        for field in metadata.placeholders.keys():
+            issues.append(("title block", f"placeholder for {field}", "Provide verified value"))
+
+        evidence_map = processing.manifest_fragments.get("evidence", {}) if processing.manifest_fragments else {}
+
+        # Section level validation
         for section in processing.sections or []:
             combined_text = " ".join(section.paragraphs)
             tokens = find_unresolved_tokens(combined_text)
             if tokens:
-                unresolved_tokens_by_section[section.name] = tokens
-                total_unresolved += len(tokens)
-            combined = combined_text.lower()
-            for token in ["purpose:", "procedures", "responsibilities", "forms", "references:"]:
-                if token not in combined:
-                    errors.append(f"Section '{section.name}' is missing subsection '{token}'.")
-                    break
-            if "em 385" not in combined:
-                warnings.append(f"Section '{section.name}' does not explicitly reference EM 385-1-1 in text.")
-            if any(contains_placeholder(par) for par in section.paragraphs):
-                warnings.append(
-                    f"Section '{section.name}' contains placeholder text that should be replaced with project-specific details."
-                )
-            
-            # Check context for warnings
-            identifier = name_to_identifier.get(section.name)
-            context = processing.context_packs.get(identifier, {}) if identifier else {}
-            if context is not None and not context.get("documents"):
-                warnings.append(f"Section '{section.name}' generated without user document context (LLM guidance only).")
-            if context is not None and not context.get("snippets"):
-                warnings.append(f"Section '{section.name}' has no supporting document snippets; review for accuracy.")
-            if not section.citations:
-                warnings.append(f"Section '{section.name}' produced without formal citations.")
-        
-        # Check title block fields
-        required_title_fields = ["project_name", "location", "owner", "prime_contractor"]
-        for field in required_title_fields:
-            value = metadata.data.get(field, "")
-            if not value or contains_placeholder(str(value)):
-                warnings.append(
-                    f"Title block field '{field}' uses placeholder content; update before issuing the CSP."
-                )
-        
-        # Fail if placeholders found
-        if total_unresolved > 0:
-            detail_lines = []
-            for section_name, tokens in unresolved_tokens_by_section.items():
-                token_patterns = [token[0] for token in tokens]
-                unique_patterns = sorted(set(token_patterns))
-                detail_lines.append(f"  {section_name}: {', '.join(unique_patterns)}")
-            warnings.append(
-                "Unresolved placeholder markers detected:\n" + "\n".join(detail_lines)
-            )
+                phrases = ", ".join(sorted({token for token, _ in tokens}))
+                issues.append((section.name, f"unresolved token(s): {phrases}", "Replace placeholder markers"))
 
-        if not processing.sub_plan_matrix:
-            warnings.append("Sub-plan applicability matrix is empty; verify DFOW mapping.")
-        
-        # Validate at least one plan is marked Required
-        required_plans = sum(
-            1 for details in processing.sub_plan_matrix.values()
-            if details.get("status") in ("Required", "Pending")
-        )
-        if required_plans == 0:
-            warnings.append("No site-specific plans marked as Required or Pending. Verify DFOW mapping.")
-        
-        # Validate evidence-based sections (if used)
-        from context.contamination_guard import detect_contamination, BANNED_PHRASES
-        insufficient_evidence_count = 0
-        contaminated_sections = []
-        
-        for section in processing.sections or []:
-            combined_text = " ".join(section.paragraphs)
-            
-            # Check for "INSUFFICIENT EVIDENCE"
             if "INSUFFICIENT EVIDENCE" in combined_text:
-                insufficient_evidence_count += 1
-                errors.append(f"Section '{section.name}' has insufficient evidence. Export blocked.")
-            
-            # Check for banned phrases (contamination)
+                issues.append((section.name, "insufficient evidence", "Meet extractive quota (≥3 snippets)"))
+
             banned_detected = detect_contamination(combined_text)
             if banned_detected:
-                contaminated_sections.append(section.name)
-                errors.append(
-                    f"Section '{section.name}' contains banned phrases: {', '.join(banned_detected[:3])}. Export blocked."
-                )
-            
-            # Check evidence count (for evidence-based sections)
-            # If section has citations, verify minimum count
-            if section.citations and len(section.citations) < 3:
-                warnings.append(
-                    f"Section '{section.name}' has only {len(section.citations)} citations. "
-                    "Minimum 3 citations recommended for evidence-based sections."
-                )
+                phrases = ", ".join(sorted(set(banned_detected)))
+                issues.append((section.name, f"banned phrase: {phrases}", "TOC leakage—sanitize before indexing"))
 
-        can_proceed = not errors
+            if any(contains_placeholder(par) for par in section.paragraphs):
+                issues.append((section.name, "placeholder text detected", "Write from evidence"))
+
+            citation_count = len(section.citations or [])
+            if citation_count < 3:
+                issues.append((section.name, f"only {citation_count} citation(s)", "Extract at least 3 supporting snippets"))
+
+            identifier = expected_titles.get(section.name)
+            evidence_entries = evidence_map.get(identifier, []) if identifier else []
+            if len(evidence_entries) < 3:
+                issues.append((section.name, f"only {len(evidence_entries)} evidence snippet(s)", "Meet extractive quota (≥3 snippets)"))
+            else:
+                project_supported = [
+                    entry
+                    for entry in evidence_entries
+                    if "em 385" not in str(entry.get("source", "")).lower()
+                ]
+                if len(project_supported) < 2:
+                    issues.append((section.name, "insufficient project evidence", "Collect ≥2 project-grounded snippets"))
+
+            if re.search(r"EM\s*385-1-1\s+§\d(?!\d)", combined_text):
+                issues.append((section.name, "unnormalized EM 385 citation", "Normalize to §XX.XX format"))
+            if re.search(r"§\d(?!\d)", combined_text):
+                issues.append((section.name, "invalid citation token", "Use §XX.XX or §XX.A.XX format"))
+
+        # Consolidate issues into single error string
+        errors: List[str] = []
+        if issues:
+            lines = [f"- {scope}: {detail} ({hint})" for scope, detail, hint in issues]
+            errors.append("Export blocked due to validation failures:\n" + "\n".join(lines))
 
         return ValidationState(
             errors=errors,
-            warnings=warnings,
+            warnings=[],
             placeholders_required=metadata.placeholders,
-            can_proceed=can_proceed,
+            can_proceed=not errors,
         )
 
 
@@ -766,6 +756,7 @@ class DefaultOutputAssembler(OutputAssembler):
             "documents": [str(Path(p)) for p in ingestion.documents],
             "sections": sections_payload,
             "sub_plans": processing.sub_plan_matrix,
+            "evidence": processing.manifest_fragments.get("evidence", {}),
             "warnings": validation.warnings,
             "outputs": {
                 "docx": str(docx_path),

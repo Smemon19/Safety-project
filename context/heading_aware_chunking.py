@@ -16,134 +16,171 @@ class ChunkWithMetadata:
     headings: List[str] = field(default_factory=list)
     page_number: Optional[int] = None
     chunk_id: str = ""
+    page_range: Tuple[Optional[int], Optional[int]] = (None, None)
+    division: str = ""
+
+
+def _derive_division(heading: str, heading_stack: List[str]) -> str:
+    candidates = [heading] + list(reversed(heading_stack))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        match = re.search(r"(division\s+\d+)", candidate, re.IGNORECASE)
+        if match:
+            return match.group(1).title()
+        match = re.search(r"(section\s+\d+)", candidate, re.IGNORECASE)
+        if match:
+            return match.group(1).title()
+    return ""
 
 
 def chunk_by_headings(
     text: str,
-    max_chunk_size: int = 2000,
-    overlap: int = 200,
-    min_chunk_size: int = 100,
+    target_tokens: int = 900,
+    overlap_tokens: int = 100,
+    min_tokens: int = 200,
+    *,
+    max_chunk_size: Optional[int] = None,
+    overlap: Optional[int] = None,
+    min_chunk_size: Optional[int] = None,
 ) -> List[ChunkWithMetadata]:
-    """Chunk text by headings with section metadata preservation.
-    
-    Args:
-        text: Full document text
-        max_chunk_size: Maximum characters per chunk
-        overlap: Character overlap between chunks within same section
-        min_chunk_size: Minimum chunk size (merge small chunks)
-        
-    Returns:
-        List of chunks with metadata
-    """
+    """Chunk text by headings with section metadata preservation."""
+
     if not text:
         return []
-    
-    # Detect headings (Markdown-style or numbered)
+
+    if max_chunk_size:
+        target_tokens = max(200, max_chunk_size // 4)
+    if overlap is not None:
+        overlap_tokens = max(0, overlap // 4)
+    if min_chunk_size is not None:
+        min_tokens = max(50, min_chunk_size // 4)
+
     heading_patterns = [
-        r'^(#{1,6})\s+(.+)$',  # Markdown headings
-        r'^(\d+[\.\d]*)\s+(.+)$',  # Numbered sections
-        r'^(Section\s+\d+|Chapter\s+\d+)[:\s]+(.+)$',  # Section/Chapter labels
-        r'^([A-Z][A-Z\s]+)$',  # ALL CAPS headings
+        r'^(section\s+\d+(?:\.\d+)*)[:\s]+(.+)$',
+        r'^(division\s+\d+(?:\.\d+)*)[:\s]+(.+)$',
+        r'^(part\s+[ivx]+)[:\s]+(.+)$',
+        r'^(\d+[\.\d]+)\s+(.+)$',
+        r'^([A-Z][A-Z\s]+)$',
     ]
-    
+
     lines = text.splitlines()
     chunks: List[ChunkWithMetadata] = []
     current_section_title = ""
     current_section_level = 0
-    current_headings: List[str] = []
-    current_text: List[str] = []
-    current_size = 0
-    
-    def _flush_chunk(force: bool = False):
-        """Flush current chunk if it has enough content."""
-        nonlocal current_text, current_size
-        if current_text and (force or current_size >= min_chunk_size):
-            chunk_text = "\n".join(current_text).strip()
-            if chunk_text:
-                chunks.append(
-                    ChunkWithMetadata(
-                        text=chunk_text,
-                        section_title=current_section_title,
-                        section_level=current_section_level,
-                        headings=list(current_headings),
-                    )
-                )
-            current_text = []
-            current_size = 0
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        line_stripped = line.strip()
-        
-        # Check if this line is a heading
+    current_heading_stack: List[Tuple[str, int]] = []
+    current_segments: List[Tuple[str, Optional[int], int]] = []
+    current_tokens = 0
+    current_page: Optional[int] = None
+
+    def add_segment(segment_text: str, page: Optional[int]) -> None:
+        nonlocal current_tokens
+        tokens = len(segment_text.split())
+        if tokens == 0:
+            return
+        current_segments.append((segment_text, page, tokens))
+        current_tokens += tokens
+
+    def flush_chunk(force: bool = False) -> None:
+        nonlocal current_segments, current_tokens
+        if not current_segments:
+            return
+        if not force and current_tokens < min_tokens:
+            return
+
+        chunk_text = "\n".join(segment for segment, _, _ in current_segments).strip()
+        if not chunk_text:
+            current_segments = []
+            current_tokens = 0
+            return
+
+        pages = [page for _, page, _ in current_segments if page is not None]
+        page_start = min(pages) if pages else None
+        page_end = max(pages) if pages else None
+
+        headings = [title for title, _ in current_heading_stack]
+        chunk = ChunkWithMetadata(
+            text=chunk_text,
+            section_title=current_section_title,
+            section_level=current_section_level,
+            headings=headings,
+            page_number=page_start,
+            page_range=(page_start, page_end),
+            division=_derive_division(current_section_title, headings),
+        )
+        chunks.append(chunk)
+
+        if overlap_tokens > 0 and current_tokens > 0:
+            overlap_segments: List[Tuple[str, Optional[int], int]] = []
+            tally = 0
+            for segment, page, tokens in reversed(current_segments):
+                if tally >= overlap_tokens:
+                    break
+                needed = overlap_tokens - tally
+                if tokens > needed:
+                    words = segment.split()
+                    trimmed = " ".join(words[-needed:])
+                    overlap_segments.insert(0, (trimmed, page, needed))
+                    tally += needed
+                    break
+                overlap_segments.insert(0, (segment, page, tokens))
+                tally += tokens
+            current_segments = overlap_segments
+            current_tokens = sum(seg[2] for seg in current_segments)
+        else:
+            current_segments = []
+            current_tokens = 0
+
+    def heading_level_from_pattern(pattern: str, match: re.Match[str]) -> int:
+        if pattern.startswith('^(section') or pattern.startswith('^(division') or pattern.startswith('^(part'):
+            return 1
+        if pattern.startswith(r'^(\d+'):
+            return match.group(1).count('.') + 1
+        return 1
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith('[[PAGE_BREAK_'):
+            try:
+                current_page = int(re.findall(r"\d+", line)[0])
+            except Exception:
+                current_page = current_page
+            continue
+
         is_heading = False
         heading_text = ""
         heading_level = 0
-        
         for pattern in heading_patterns:
-            match = re.match(pattern, line_stripped)
+            match = re.match(pattern, line, flags=re.IGNORECASE)
             if match:
+                heading_text = match.group(1).strip() if len(match.groups()) == 1 else match.group(1).strip()
+                remainder = match.group(2).strip() if len(match.groups()) > 1 else ""
+                if remainder:
+                    heading_text = f"{heading_text} {remainder}".strip()
+                heading_level = heading_level_from_pattern(pattern, match)
                 is_heading = True
-                if pattern.startswith(r'^(#{1,6})'):  # Markdown
-                    heading_level = len(match.group(1))
-                    heading_text = match.group(2).strip()
-                elif pattern.startswith(r'^(\d+[\.\d]*)'):  # Numbered
-                    heading_level = match.group(1).count('.') + 1
-                    heading_text = match.group(2).strip()
-                else:
-                    heading_level = 1
-                    heading_text = match.group(2).strip() if len(match.groups()) > 1 else match.group(1).strip()
                 break
-        
+
         if is_heading and heading_text:
-            # Flush current chunk if we're starting a new section
-            if current_size > 0:
-                _flush_chunk(force=True)
-            
-            # Update section context
-            if heading_level <= current_section_level:
-                # Pop headings at same or higher level
-                current_headings = [
-                    h for h, lvl in zip(
-                        current_headings,
-                        [len(re.findall(r'\.', h.split()[0])) + 1 if re.match(r'^\d+', h.split()[0]) else 1
-                         for h in current_headings]
-                    ) if lvl < heading_level
-                ]
-            
+            flush_chunk(force=True)
+            while current_heading_stack and current_heading_stack[-1][1] >= heading_level:
+                current_heading_stack.pop()
+            current_heading_stack.append((heading_text, heading_level))
             current_section_title = heading_text
             current_section_level = heading_level
-            current_headings.append(heading_text)
-            
-            # Include heading in chunk
-            current_text.append(line)
-            current_size += len(line)
-            i += 1
+            add_segment(raw_line, current_page)
             continue
-        
-        # Regular content line
-        line_len = len(line)
-        
-        # Check if adding this line would exceed max size
-        if current_size + line_len > max_chunk_size and current_size >= min_chunk_size:
-            # Flush and start new chunk with overlap
-            _flush_chunk()
-            
-            # Add overlap from previous chunk
-            if chunks:
-                last_chunk_text = chunks[-1].text
-                overlap_text = last_chunk_text[-overlap:] if len(last_chunk_text) > overlap else last_chunk_text
-                current_text.append(overlap_text)
-                current_size = len(overlap_text)
-        
-        current_text.append(line)
-        current_size += line_len
-        i += 1
-    
-    # Flush final chunk
-    _flush_chunk(force=True)
-    
+
+        if current_tokens + len(line.split()) > target_tokens and current_tokens >= min_tokens:
+            flush_chunk(force=True)
+
+        add_segment(raw_line, current_page)
+
+    flush_chunk(force=True)
+
     return chunks
 
 
@@ -154,16 +191,28 @@ def create_chunk_metadata(chunk: ChunkWithMetadata, doc_id: str, chunk_idx: int)
     chunk_id = f"{doc_id}_chunk_{chunk_idx:05d}"
     chunk_hash = hashlib.sha256(chunk.text.encode()).hexdigest()[:8]
     
-    return {
+    page_start, page_end = chunk.page_range
+    page_range = None
+    if page_start is not None and page_end is not None:
+        page_range = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+    elif page_start is not None:
+        page_range = str(page_start)
+
+    metadata: Dict[str, Any] = {
         "chunk_id": chunk_id,
         "doc_id": doc_id,
         "section_title": chunk.section_title,
         "section_level": chunk.section_level,
         "headings": " | ".join(chunk.headings) if chunk.headings else "",
-        "page_number": chunk.page_number,
         "chunk_hash": chunk_hash,
         "source_type": "project_document",
+        "division": chunk.division,
+        "page_range": page_range,
+        "token_count": len(chunk.text.split()),
     }
+    if page_start is not None:
+        metadata["page_number"] = page_start
+    return metadata
 
 
 __all__ = ["chunk_by_headings", "ChunkWithMetadata", "create_chunk_metadata"]
