@@ -2,7 +2,9 @@ from __future__ import annotations
 
 """Helpers for managing placeholder text across CSP outputs."""
 
+import re
 from typing import Iterable, List, Tuple
+
 
 PLACEHOLDER_PREFIX = "«PLACEHOLDER:"
 PLACEHOLDER_SUFFIX = "»"
@@ -86,7 +88,6 @@ def find_unresolved_tokens(text: str) -> List[Tuple[str, int]]:
         start = pos + 1
     
     # Check for {project_, {ssho, {pm, {quality patterns
-    import re
     tracked_patterns = [
         (r'\{project_[^\}]*\}', "{project_*"),
         (r'\{ssho[^\}]*\}', "{ssho*"),
