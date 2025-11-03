@@ -88,20 +88,24 @@ def _read_text_file(path: Path) -> str:
             return ""
 
 
-def _extract_project_metadata(text: str) -> Dict[str, str]:
+def _extract_project_metadata(original_text: str, sanitized_text: str) -> Dict[str, str]:
     """Extract project metadata using structured cover-page heuristics."""
 
-    extracted = extract_title_block_fields(text)
+    primary = extract_title_block_fields(sanitized_text)
+    fallback = extract_title_block_fields(original_text)
 
-    sanitized: Dict[str, str] = {}
-    for key, value in extracted.items():
+    merged: Dict[str, str] = {}
+    candidate_keys = set(primary.keys()) | set(fallback.keys())
+
+    for key in candidate_keys:
+        value = primary.get(key) or fallback.get(key)
         if not value:
             continue
         if any(bad in value.lower() for bad in BANNED_SUBSTRINGS):
             continue
-        sanitized[key] = value
+        merged[key] = value
 
-    return sanitized
+    return merged
 
 
 def _extract_em385_references(text: str) -> List[str]:
@@ -161,7 +165,7 @@ class DocumentIngestionEngine:
             sanitized_text = sanitize_document_text(text)
             logs.append(f"Sanitized document: {path.name} ({len(text)} -> {len(sanitized_text)} chars)")
 
-            metadata = _extract_project_metadata(sanitized_text)
+            metadata = _extract_project_metadata(text, sanitized_text)
             parsed_docs.append(ParsedDocument(path=path, text=sanitized_text, metadata=metadata))
             logs.append(f"Parsed document: {path.name} ({len(text)} chars)")
 

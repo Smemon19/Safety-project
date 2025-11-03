@@ -57,21 +57,41 @@ def chunk_by_headings(
         min_tokens = max(50, min_chunk_size // 4)
 
     heading_patterns = [
-        r'^(section\s+\d+(?:\.\d+)*)[:\s]+(.+)$',
-        r'^(division\s+\d+(?:\.\d+)*)[:\s]+(.+)$',
-        r'^(part\s+[ivx]+)[:\s]+(.+)$',
-        r'^(\d+[\.\d]+)\s+(.+)$',
-        r'^([A-Z][A-Z\s]+)$',
+        r'^(section\s+\d+(?:\.\d+)*)\s*[:\-–—]?\s*(.+)$',
+        r'^(section\s+\d{2}(?:\s+\d{2}){1,3})\s*[:\-–—]?\s*(.+)$',
+        r'^(division\s+\d+(?:\.\d+)*)\s*[:\-–—]?\s*(.+)$',
+        r'^(part\s+[ivx]+)\s*[:\-–—]?\s*(.+)$',
+        r'^(part\s+\d+)\s*[:\-–—]?\s*(.+)$',
+        r'^(\d+[A-Z]?\.\d+(?:\.\d+)*)\s+(.+)$',
+        r'^((?:\d{2}\s+){1,4}\d{2})\s+(.+)$',
     ]
 
     lines = text.splitlines()
     chunks: List[ChunkWithMetadata] = []
-    current_section_title = ""
+    current_section_title = "Front Matter"
     current_section_level = 0
     current_heading_stack: List[Tuple[str, int]] = []
     current_segments: List[Tuple[str, Optional[int], int]] = []
     current_tokens = 0
     current_page: Optional[int] = None
+
+    def looks_like_freeform_heading(line: str) -> bool:
+        if not line:
+            return False
+        if len(line) < 6 or len(line) > 120:
+            return False
+        if line.endswith('.'):
+            return False
+        words = line.split()
+        if len(words) < 2:
+            return False
+        letters = sum(1 for ch in line if ch.isalpha())
+        if letters == 0:
+            return False
+        uppercase = sum(1 for ch in line if ch.isupper())
+        if uppercase / max(letters, 1) < 0.6:
+            return False
+        return True
 
     def add_segment(segment_text: str, page: Optional[int]) -> None:
         nonlocal current_tokens
@@ -99,14 +119,15 @@ def chunk_by_headings(
         page_end = max(pages) if pages else None
 
         headings = [title for title, _ in current_heading_stack]
+        section_title = current_section_title or (current_heading_stack[-1][0] if current_heading_stack else "Front Matter")
         chunk = ChunkWithMetadata(
             text=chunk_text,
-            section_title=current_section_title,
+            section_title=section_title,
             section_level=current_section_level,
             headings=headings,
             page_number=page_start,
             page_range=(page_start, page_end),
-            division=_derive_division(current_section_title, headings),
+            division=_derive_division(section_title, headings),
         )
         chunks.append(chunk)
 
@@ -136,6 +157,10 @@ def chunk_by_headings(
             return 1
         if pattern.startswith(r'^(\d+'):
             return match.group(1).count('.') + 1
+        if pattern.startswith(r'^(\d+[A-Z]?\.'):
+            return match.group(1).count('.') + 1
+        if pattern.startswith('^((?:'):
+            return 1
         return 1
 
     for raw_line in lines:
@@ -156,13 +181,18 @@ def chunk_by_headings(
         for pattern in heading_patterns:
             match = re.match(pattern, line, flags=re.IGNORECASE)
             if match:
-                heading_text = match.group(1).strip() if len(match.groups()) == 1 else match.group(1).strip()
+                heading_text = match.group(1).strip()
                 remainder = match.group(2).strip() if len(match.groups()) > 1 else ""
                 if remainder:
                     heading_text = f"{heading_text} {remainder}".strip()
                 heading_level = heading_level_from_pattern(pattern, match)
                 is_heading = True
                 break
+
+        if not is_heading and looks_like_freeform_heading(line):
+            heading_text = line.strip()
+            heading_level = 1
+            is_heading = True
 
         if is_heading and heading_text:
             flush_chunk(force=True)
