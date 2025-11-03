@@ -6,7 +6,7 @@ import pytest
 from context.document_sanitizer import sanitize_document_text
 from context.section_retriever import SectionScopedRetriever
 from context.dfow_mapping import map_dfow_to_plans
-from generators.evidence_generator import EvidenceBasedSectionGenerator, ExtractedEvidence
+from generators.evidence_generator import EvidenceBasedSectionGenerator
 from pipelines.services.defaults import DefaultValidator
 from pipelines.csp_pipeline import MetadataState, ProcessingState
 from models.csp import CspSection, CspCitation
@@ -93,15 +93,15 @@ def test_extractive_quota_enforced():
     async def _run():
         generator = EvidenceBasedSectionGenerator("dummy", chroma_client=None)
 
-        async def fake_extract(*args, **kwargs):
-            return [
-                ExtractedEvidence(chunk_id="CH1", bullet_text="Evidence one", source="doc1"),
-                ExtractedEvidence(chunk_id="CH2", bullet_text="Evidence two", source="doc1"),
-            ]
+        async def fake_stage(*args, **kwargs):  # type: ignore
+            return []
 
-        generator.extract_evidence = fake_extract  # type: ignore
-        result = await generator.generate_section("section_01", {}, [])
-        assert result.has_insufficient_evidence
+        generator._stage_one_prefilter = fake_stage  # type: ignore
+        generator._stage_two_rerank = fake_stage  # type: ignore
+
+        definition = SECTION_DEFINITIONS[0]
+        result = await generator.build_context_packet(definition, {})
+        assert result.insufficient_reasons
 
     asyncio.run(_run())
 
@@ -132,16 +132,39 @@ def test_offline_mode_does_not_abstrate(monkeypatch):
 
         generator = EvidenceBasedSectionGenerator("dummy", chroma_client=None)
 
-        async def fake_extract(*args, **kwargs):
+        from context.section_retriever import EvidenceChunk
+
+        async def fake_stage_one(*args, **kwargs):  # type: ignore
             return [
-                ExtractedEvidence(chunk_id="CH1", bullet_text="Evidence one", source="doc1"),
-                ExtractedEvidence(chunk_id="CH2", bullet_text="Evidence two", source="doc1"),
-                ExtractedEvidence(chunk_id="CH3", bullet_text="Evidence three", source="EM 385"),
+                EvidenceChunk(
+                    chunk_id="P1",
+                    text="The SSHO completes daily inspections covering all active work areas.",
+                    source="project_doc.pdf",
+                    page_number=1,
+                ),
+                EvidenceChunk(
+                    chunk_id="P2",
+                    text="Supervisors document findings and track closure of deficiencies in the project log.",
+                    source="project_doc.pdf",
+                    page_number=2,
+                ),
+                EvidenceChunk(
+                    chunk_id="EM1",
+                    text="EM 385-1-1 §01.A.13 requires SSHO authority to stop work when hazards are observed.",
+                    source="EM 385-1-1",
+                    page_number=12,
+                ),
             ]
 
-        generator.extract_evidence = fake_extract  # type: ignore
-        result = await generator.generate_section("section_01", {}, [])
-        assert result.has_insufficient_evidence
+        async def fake_stage_two(*args, **kwargs):  # type: ignore
+            return await fake_stage_one()
+
+        generator._stage_one_prefilter = fake_stage_one  # type: ignore
+        generator._stage_two_rerank = fake_stage_two  # type: ignore
+
+        definition = SECTION_DEFINITIONS[1]  # Section 2 requires 1 EM bullet
+        result = await generator.build_context_packet(definition, {})
+        assert result.insufficient_reasons
 
     asyncio.run(_run())
 

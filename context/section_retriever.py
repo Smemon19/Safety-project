@@ -26,6 +26,7 @@ class SectionQuery:
     section_identifier: str
     base_query: str
     keywords: List[str]
+    topic_tags: List[str]
     em385_refs: List[str]
     filters: Dict[str, Any]
 
@@ -49,14 +50,18 @@ class SectionScopedRetriever:
         """Build per-section query templates from SECTION_DEFINITIONS."""
         for section_def in SECTION_DEFINITIONS:
             # Build query from section description + keywords
-            query_parts = [section_def.description]
+            query_parts = [section_def.intent]
+            if section_def.description:
+                query_parts.append(section_def.description)
             query_parts.extend(section_def.keywords[:3])  # Top 3 keywords
+            query_parts.extend(section_def.topic_tags[:2])
             base_query = " ".join(query_parts)
-            
+
             self._section_queries[section_def.identifier] = SectionQuery(
                 section_identifier=section_def.identifier,
                 base_query=base_query,
                 keywords=section_def.keywords,
+                topic_tags=section_def.topic_tags,
                 em385_refs=section_def.em385_refs,
                 filters={},
             )
@@ -73,7 +78,10 @@ class SectionScopedRetriever:
         
         # Enhance with project-specific terms
         query_parts = [base.base_query]
-        
+
+        if base.topic_tags:
+            query_parts.append(" ".join(base.topic_tags[:2]))
+
         # Add DFOW if available
         dfow = project_context.get("dfow", [])
         if dfow:
