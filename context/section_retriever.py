@@ -95,9 +95,9 @@ class SectionScopedRetriever:
         self,
         section_identifier: str,
         project_context: Dict[str, Any],
-        top_k: int = 5,
+        top_k: int = 6,
         use_mmr: bool = True,
-        mmr_diversity: float = 0.5,
+        mmr_diversity: float = 0.7,
     ) -> List[EvidenceChunk]:
         """Retrieve evidence chunks for a specific section.
         
@@ -179,22 +179,30 @@ class SectionScopedRetriever:
         filtered_ids = []
         filtered_docs = []
         filtered_metas = []
-        
-        for i, (chunk_id, doc, meta) in enumerate(zip(vec_ids, vec_docs, vec_metas)):
+
+        for chunk_id, doc, meta in zip(vec_ids, vec_docs, vec_metas):
+            meta = meta or {}
             # Check if chunk should be excluded
             if tag_chunk_for_exclusion(doc):
                 continue
-            
-            # Domain filter: prefer project documents or EM 385
+
             source = meta.get("source", "") or meta.get("file", "") or ""
-            if source:
-                # Accept project docs or EM 385 references
-                is_project_doc = "em385" not in source.lower() and "project" in str(meta).lower()
-                is_em385 = "em385" in source.lower() or "em 385" in source.lower()
-                
-                if not (is_project_doc or is_em385):
-                    continue
-            
+            source_type = (meta.get("source_type") or "").lower()
+            is_project_doc = source_type == "project_document" or "project" in source_type
+            is_em385 = source_type == "em385" or "em 385" in source.lower()
+            if not is_project_doc and not is_em385:
+                if "em385" in source.lower() or "em 385" in source.lower():
+                    is_em385 = True
+                elif source.lower().endswith(".pdf") or source.lower().endswith(".docx"):
+                    is_project_doc = True
+
+            if not (is_project_doc or is_em385):
+                continue
+
+            # Ensure section titles exist for domain enforcement
+            if not meta.get("section_title"):
+                continue
+
             filtered_ids.append(chunk_id)
             filtered_docs.append(doc)
             filtered_metas.append(meta)
@@ -218,6 +226,11 @@ class SectionScopedRetriever:
             filtered_docs = filtered_docs[:top_k]
             filtered_metas = filtered_metas[:top_k]
         
+        # Ensure chunks align to dominant section domain
+        filtered_ids, filtered_docs, filtered_metas = self._enforce_section_domain(
+            filtered_ids, filtered_docs, filtered_metas
+        )
+
         # Build EvidenceChunk objects
         evidence_chunks = []
         for chunk_id, doc, meta in zip(filtered_ids, filtered_docs, filtered_metas):
@@ -231,20 +244,55 @@ class SectionScopedRetriever:
                     page_num = int(page_num)
                 except ValueError:
                     page_num = None
-            
+
+            page_label = meta_dict.get("page_label") or meta_dict.get("page_range")
+
             evidence_chunks.append(
                 EvidenceChunk(
                     chunk_id=chunk_id,
                     text=doc,
                     source=source,
                     page_number=page_num,
-                    page_label=meta_dict.get("page_label"),
+                    page_label=page_label,
                     section_path=meta_dict.get("section_path") or meta_dict.get("section_title"),
                     metadata=meta_dict,
                 )
             )
         
         return evidence_chunks
+
+
+    def _enforce_section_domain(
+        self,
+        ids: List[str],
+        docs: List[str],
+        metas: List[Dict[str, Any]],
+    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        """Keep only chunks that share the dominant section_title."""
+
+        if not metas:
+            return ids, docs, metas
+
+        section_counts: Dict[str, int] = {}
+        for meta in metas:
+            title = (meta or {}).get("section_title") or ""
+            if title:
+                section_counts[title] = section_counts.get(title, 0) + 1
+
+        if not section_counts:
+            return ids, docs, metas
+
+        dominant = max(section_counts.items(), key=lambda item: item[1])[0]
+        filtered = [
+            (cid, doc, meta)
+            for cid, doc, meta in zip(ids, docs, metas)
+            if (meta or {}).get("section_title") == dominant
+        ]
+        if not filtered:
+            return ids, docs, metas
+
+        new_ids, new_docs, new_metas = zip(*filtered)
+        return list(new_ids), list(new_docs), list(new_metas)
 
 
 __all__ = ["SectionScopedRetriever", "EvidenceChunk", "SectionQuery"]
