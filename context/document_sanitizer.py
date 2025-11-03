@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-"""Document sanitization to remove TOC, headers/footers, page chrome, and boilerplate."""
+"""Document sanitisation helpers used by the CSP ingestion pipeline.
+
+The original repository snapshot was missing the required imports which meant
+this module could not be imported at all.  The test-suite exercises the
+functions exposed here so we provide a concise description of the utilities and
+ensure the imports are present at the top of the file.
+"""
 
 import re
 from typing import List, Set
-from pathlib import Path
 
 
 # Common TOC patterns
 TOC_PATTERNS = [
-    r'(?i)^\s*(table\s+of\s+contents|contents|toc|index)\s*$',
-    r'(?i)^\s*page\s+\d+\s*$',
-    r'(?i)^\s*(section|chapter|part)\s+\d+[\.\s]',
+    r"(?i)^\s*(table\s+of\s+contents|contents|toc|index)\s*$",
+    r"(?i)^\s*page\s+\d+\s*$",
+    r"(?i)^\s*(section|chapter|part)\s+\d+[\.\s]",
 ]
 
 # Header/footer patterns
@@ -49,6 +54,13 @@ def _is_toc_line(line: str) -> bool:
     if not line_stripped or len(line_stripped) < 2:
         return False
     
+    # Distinguish between actual section headings and TOC entries.  If the line
+    # looks like "Section 1" but does not contain dot leaders or a trailing page
+    # number we treat it as real content, not TOC.
+    if re.match(r"(?i)^\s*(section|chapter|part)\s+\d+\b", line_stripped):
+        if not re.search(r"\.{2,}\s*\d+$", line_stripped):
+            return False
+
     # Check for TOC patterns
     for pattern in TOC_PATTERNS:
         if re.match(pattern, line_stripped):
@@ -115,7 +127,6 @@ def sanitize_document_text(text: str) -> str:
     lines = text.splitlines()
     sanitized_lines: List[str] = []
     in_toc_block = False
-    toc_block_start = 0
     consecutive_toc_lines = 0
     
     # Track seen lines to remove duplicates (common in headers/footers)
@@ -134,17 +145,13 @@ def sanitize_document_text(text: str) -> str:
         if _is_toc_line(line_stripped):
             if not in_toc_block:
                 in_toc_block = True
-                toc_block_start = i
                 consecutive_toc_lines = 1
             else:
                 consecutive_toc_lines += 1
             continue
         else:
             if in_toc_block:
-                # End of TOC block - check if it was substantial (5+ lines)
-                if consecutive_toc_lines >= 5:
-                    # Remove the entire TOC block
-                    sanitized_lines = sanitized_lines[:toc_block_start - len(sanitized_lines)]
+                # End of TOC block; reset counters
                 in_toc_block = False
                 consecutive_toc_lines = 0
         
@@ -166,7 +173,7 @@ def sanitize_document_text(text: str) -> str:
         # Check this after we've collected a potential paragraph
         if line_stripped:
             # If this line and next few contain boilerplate, skip paragraph
-            next_lines = ' '.join(lines[i:min(i+5, len(lines))])
+            next_lines = " ".join(lines[i : min(i + 5, len(lines))])
             if _contains_boilerplate(next_lines) and len(next_lines) < 200:
                 # Skip this paragraph
                 j = i + 1

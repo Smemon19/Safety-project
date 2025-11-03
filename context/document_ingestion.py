@@ -298,7 +298,11 @@ class DocumentIngestionEngine:
 
             for candidate_name in ("project_meta.json", "manifest.json"):
                 candidate = path.parent / candidate_name
-        if candidate.exists() and candidate.suffix.lower() == ".json" and candidate not in metadata_files:
+                if (
+                    candidate.exists()
+                    and candidate.suffix.lower() == ".json"
+                    and candidate not in metadata_files
+                ):
                     metadata_files.append(candidate)
 
         combined_text = "\n\n".join(doc.text for doc in parsed_docs)

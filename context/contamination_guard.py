@@ -101,19 +101,23 @@ def filter_contaminated_content(
     
     evidence_texts = evidence_texts or []
     
-    # Split into sentences
-    sentences = re.split(r'([.!?]+\s+)', text)
-    # Recombine sentences with their punctuation
+    # Split into sentences while retaining punctuation
     sentence_pairs = []
-    for i in range(0, len(sentences) - 1, 2):
-        if i + 1 < len(sentences):
-            sentence_pairs.append((sentences[i], sentences[i + 1]))
-        else:
-            sentence_pairs.append((sentences[i], ""))
-    
-    clean_sentences = []
+    for match in re.finditer(r'[^.!?]+[.!?]?', text):
+        sentence = match.group(0)
+        if not sentence:
+            continue
+        # Separate punctuation for later reassembly
+        stripped = sentence.rstrip()
+        trailing = sentence[len(stripped):]
+        if not trailing and stripped and stripped[-1] in ".!?":
+            trailing = stripped[-1]
+            stripped = stripped[:-1]
+        sentence_pairs.append((stripped, trailing))
+
+    clean_sentences: List[str] = []
     contamination_count = 0
-    
+
     for sentence, punctuation in sentence_pairs:
         sentence_stripped = sentence.strip()
         if not sentence_stripped:

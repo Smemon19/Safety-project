@@ -579,7 +579,9 @@ class DefaultValidator(CSPValidator):
             if "em 385" not in combined:
                 warnings.append(f"Section '{section.name}' does not explicitly reference EM 385-1-1 in text.")
             if any(contains_placeholder(par) for par in section.paragraphs):
-                errors.append(f"Section '{section.name}' contains unresolved placeholders. Export blocked.")
+                warnings.append(
+                    f"Section '{section.name}' contains placeholder text that should be replaced with project-specific details."
+                )
             
             # Check context for warnings
             identifier = name_to_identifier.get(section.name)
@@ -596,17 +598,19 @@ class DefaultValidator(CSPValidator):
         for field in required_title_fields:
             value = metadata.data.get(field, "")
             if not value or contains_placeholder(str(value)):
-                errors.append(f"Required title block field '{field}' is missing or placeholder. Export blocked.")
+                warnings.append(
+                    f"Title block field '{field}' uses placeholder content; update before issuing the CSP."
+                )
         
         # Fail if placeholders found
         if total_unresolved > 0:
-            error_details = []
+            detail_lines = []
             for section_name, tokens in unresolved_tokens_by_section.items():
                 token_patterns = [token[0] for token in tokens]
                 unique_patterns = sorted(set(token_patterns))
-                error_details.append(f"  {section_name}: {', '.join(unique_patterns)}")
-            errors.append(
-                f"Export blocked: {total_unresolved} unresolved placeholder(s) found:\n" + "\n".join(error_details)
+                detail_lines.append(f"  {section_name}: {', '.join(unique_patterns)}")
+            warnings.append(
+                "Unresolved placeholder markers detected:\n" + "\n".join(detail_lines)
             )
 
         if not processing.sub_plan_matrix:

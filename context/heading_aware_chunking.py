@@ -54,10 +54,10 @@ def chunk_by_headings(
     current_text: List[str] = []
     current_size = 0
     
-    def _flush_chunk():
+    def _flush_chunk(force: bool = False):
         """Flush current chunk if it has enough content."""
         nonlocal current_text, current_size
-        if current_text and current_size >= min_chunk_size:
+        if current_text and (force or current_size >= min_chunk_size):
             chunk_text = "\n".join(current_text).strip()
             if chunk_text:
                 chunks.append(
@@ -99,7 +99,7 @@ def chunk_by_headings(
         if is_heading and heading_text:
             # Flush current chunk if we're starting a new section
             if current_size > 0:
-                _flush_chunk()
+                _flush_chunk(force=True)
             
             # Update section context
             if heading_level <= current_section_level:
@@ -142,7 +142,7 @@ def chunk_by_headings(
         i += 1
     
     # Flush final chunk
-    _flush_chunk()
+    _flush_chunk(force=True)
     
     return chunks
 
