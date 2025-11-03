@@ -94,7 +94,7 @@ DEFAULT_PLAN_DATA: List[Dict[str, object]] = [
         "em385_refs": ["§5-7.a"],
         "dfow_keywords": ["pile driving", "demolition", "drilling"],
         "hazard_keywords": ["noise", "hearing"],
-        "always_required": True,
+        "always_required": False,
     },
     {
         "name": "Respiratory Protection Plan",
@@ -160,23 +160,59 @@ def get_plan_definitions() -> List[PlanDefinition]:
     return list(_load_plan_definitions())
 
 
-def map_dfow_to_plans(dfow: List[str], hazards: List[str] | None = None) -> Dict[str, Dict[str, object]]:
+def map_dfow_to_plans(dfow: List[object], hazards: List[object] | None = None) -> Dict[str, Dict[str, object]]:
     """Return applicability matrix for Section 11 sub-plans."""
 
     dfow = dfow or []
     hazards = hazards or []
-    dfow_lower = [item.lower() for item in dfow]
-    hazards_lower = [item.lower() for item in hazards]
+
+    def _extract(entry: object) -> tuple[str, List[str]]:
+        if isinstance(entry, dict):
+            text = str(entry.get("text") or entry.get("value") or "")
+            chunk_data = entry.get("chunk_ids") or entry.get("chunk_id") or []
+            if isinstance(chunk_data, str):
+                chunk_ids = [chunk_data]
+            else:
+                chunk_ids = list(chunk_data)
+            return text, chunk_ids
+        return str(entry), []
+
+    dfow_texts: List[str] = []
+    dfow_chunks: List[List[str]] = []
+    for entry in dfow:
+        text, chunk_ids = _extract(entry)
+        dfow_texts.append(text)
+        dfow_chunks.append(chunk_ids)
+
+    hazards_texts: List[str] = []
+    hazards_chunks: List[List[str]] = []
+    for entry in hazards:
+        text, chunk_ids = _extract(entry)
+        hazards_texts.append(text)
+        hazards_chunks.append(chunk_ids)
+
+    dfow_lower = [text.lower() for text in dfow_texts]
+    hazards_lower = [text.lower() for text in hazards_texts]
     planning_matrix: Dict[str, Dict[str, object]] = {}
 
     for plan in _load_plan_definitions():
         matched_dfow = [
-            dfow[idx]
+            dfow_texts[idx]
+            for idx, low in enumerate(dfow_lower)
+            if any(keyword in low for keyword in plan.dfow_keywords)
+        ]
+        matched_dfow_chunks = [
+            dfow_chunks[idx]
             for idx, low in enumerate(dfow_lower)
             if any(keyword in low for keyword in plan.dfow_keywords)
         ]
         matched_hazards = [
-            hazards[idx]
+            hazards_texts[idx]
+            for idx, low in enumerate(hazards_lower)
+            if any(keyword in low for keyword in plan.hazard_keywords)
+        ]
+        matched_hazard_chunks = [
+            hazards_chunks[idx]
             for idx, low in enumerate(hazards_lower)
             if any(keyword in low for keyword in plan.hazard_keywords)
         ]
@@ -187,9 +223,13 @@ def map_dfow_to_plans(dfow: List[str], hazards: List[str] | None = None) -> Dict
             if plan.always_required and not (matched_dfow or matched_hazards):
                 justification = "Baseline requirement per EM 385"
             elif matched_dfow:
-                justification = f"Triggered by DFOW: {', '.join(matched_dfow)}"
+                evidence_chunks = sorted({cid for group in matched_dfow_chunks for cid in group if cid})
+                evidence_suffix = f" (evidence: {', '.join(evidence_chunks)})" if evidence_chunks else ""
+                justification = f"Triggered by DFOW: {', '.join(matched_dfow)}{evidence_suffix}"
             else:
-                justification = f"Triggered by hazards: {', '.join(matched_hazards)}"
+                evidence_chunks = sorted({cid for group in matched_hazard_chunks for cid in group if cid})
+                evidence_suffix = f" (evidence: {', '.join(evidence_chunks)})" if evidence_chunks else ""
+                justification = f"Triggered by hazards: {', '.join(matched_hazards)}{evidence_suffix}"
         else:
             status = "Not Applicable"
             justification = "Scope does not invoke this plan"
