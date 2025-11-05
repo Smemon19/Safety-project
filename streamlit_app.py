@@ -47,6 +47,18 @@ from export.markdown_writer import write_aha_book_md, write_csp_md, write_aha_si
 from pipelines.csp_pipeline import DocumentSourceChoice, MetadataSourceChoice, ValidationError
 from pipelines.decision_providers import StreamlitDecisionProvider
 from pipelines.runtime import build_pipeline, generate_run_id
+from section11.constants import EM_385_CATEGORIES
+from section11.models import CategoryAssignment, CategoryStatus, ParsedSpec, Section11Run
+from section11.pipeline import (
+    apply_overrides,
+    build_assignments,
+    create_context,
+    enrich_codes_with_firestore,
+    parse_and_detect,
+    persist_uploaded_file,
+    reconcile_categories,
+    run_pipeline,
+)
 
 async def get_agent_deps(header_contains: Optional[str], source_contains: Optional[str]):
     resolved_collection = resolve_collection_name(None)
@@ -123,6 +135,228 @@ async def run_agent_with_streaming(user_input):
             yield f"Model request failed ({getattr(e, 'status_code', 'error')}). Please try again later."
     except Exception as e:
         yield "An unexpected error occurred while contacting the model. Check logs and your .env configuration."
+
+
+def _section11_state() -> dict:
+    if "section11_state" not in st.session_state:
+        st.session_state.section11_state = {
+            "context": None,
+            "source_path": None,
+            "parsed": None,
+            "assignments": None,
+            "overrides": {},
+            "run": None,
+        }
+    return st.session_state.section11_state
+
+
+def _render_section11_metrics(parsed: ParsedSpec | None, assignments: list[CategoryAssignment] | None, run: Section11Run | None):
+    codes_found = len(parsed.codes) if parsed else 0
+    require_aha = sum(1 for code in parsed.codes if code.requires_aha) if parsed else 0
+    categories = 0
+    unmapped = 0
+    if parsed and assignments:
+        effective = set()
+        for assignment in assignments:
+            code = next((c for c in parsed.codes if c.code == assignment.code), None)
+            if code and code.requires_aha:
+                effective.add(assignment.effective_category or "Unmapped")
+                if assignment.effective_category in {"", "Unmapped"}:
+                    unmapped += 1
+        categories = len(effective)
+    aha_created = sum(1 for bundle in (run.bundles if run else []) if bundle.aha.status == CategoryStatus.required)
+    aha_pending = sum(1 for bundle in (run.bundles if run else []) if bundle.aha.status != CategoryStatus.required)
+    plan_created = sum(1 for bundle in (run.bundles if run else []) if bundle.plan.status == CategoryStatus.required)
+    plan_pending = sum(1 for bundle in (run.bundles if run else []) if bundle.plan.status != CategoryStatus.required)
+
+    cols = st.columns(6)
+    cols[0].metric("Codes Found", codes_found)
+    cols[1].metric("Require AHA", require_aha)
+    cols[2].metric("Categories", categories)
+    cols[3].metric("Unmapped", unmapped)
+    cols[4].metric("AHAs Created", aha_created, delta=-aha_pending if aha_pending else None)
+    cols[5].metric("Safety Plans", plan_created, delta=-plan_pending if plan_pending else None)
+
+
+def render_section11_tab():
+    state = _section11_state()
+    st.subheader("Section 11 Generator — Test")
+
+    uploaded = st.file_uploader(
+        "Upload Section 11 design spec", type=["pdf", "docx"], accept_multiple_files=False, key="section11_upload"
+    )
+
+    parse_clicked = st.button("Parse & Detect", type="primary", disabled=uploaded is None)
+    if parse_clicked and uploaded is not None:
+        try:
+            context = create_context(collection_name=getattr(st.session_state.agent_deps, "collection_name", None))
+            source_path = persist_uploaded_file(context, uploaded.name, uploaded.getbuffer())
+            parsed = parse_and_detect(source_path, context)
+            try:
+                parsed = enrich_codes_with_firestore(parsed)
+            except Exception as exc:  # pragma: no cover
+                st.warning(f"Firebase lookups unavailable: {exc}")
+            assignments = build_assignments(parsed)
+            state.update(
+                {
+                    "context": context,
+                    "source_path": source_path,
+                    "parsed": parsed,
+                    "assignments": assignments,
+                    "overrides": {},
+                    "run": None,
+                }
+            )
+            st.success("Parsing complete.")
+        except Exception as exc:  # pragma: no cover
+            st.error(f"Failed to parse: {exc}")
+
+    parsed: ParsedSpec | None = state.get("parsed")
+    assignments: list[CategoryAssignment] | None = state.get("assignments")
+    run: Section11Run | None = state.get("run")
+
+    _render_section11_metrics(parsed, assignments, run)
+
+    if parsed:
+        st.markdown("### Scope Summary")
+        for line in parsed.scope_summary:
+            st.markdown(f"- {line}")
+
+        st.markdown("### Codes Detected")
+        rows = [
+            {
+                "Code": code.code,
+                "Title": code.title,
+                "Requires AHA": code.requires_aha,
+                "Suggested Category": code.suggested_category or "Unmapped",
+                "Decision Source": code.decision_source,
+                "Notes": code.notes,
+            }
+            for code in parsed.codes
+        ]
+        st.dataframe(rows, use_container_width=True)
+
+        if parsed.hazard_phrases:
+            st.markdown("### Potential Hazard Phrases")
+            st.write("\n".join(f"• {phrase}" for phrase in parsed.hazard_phrases))
+
+    overrides = state.get("overrides", {})
+    if parsed and assignments:
+        requiring = [code for code in parsed.codes if code.requires_aha]
+        if requiring:
+            st.markdown("### Category Review")
+            for code in requiring:
+                assignment = next((a for a in assignments if a.code == code.code), None)
+                if not assignment:
+                    continue
+                default = assignment.override or assignment.suggested_category or "Unmapped"
+                try:
+                    index = EM_385_CATEGORIES.index(default)
+                except ValueError:
+                    index = EM_385_CATEGORIES.index("Unmapped") if "Unmapped" in EM_385_CATEGORIES else 0
+                selection = st.selectbox(
+                    f"{code.code}",
+                    EM_385_CATEGORIES,
+                    index=index,
+                    key=f"section11_category_{code.code}",
+                    help=assignment.why or "",
+                )
+                overrides[code.code] = selection
+            state["overrides"] = overrides
+            apply_overrides(assignments, overrides)
+            reconcile_categories(parsed, assignments)
+
+    unmapped_remaining = 0
+    if parsed and assignments:
+        for assignment in assignments:
+            code = next((c for c in parsed.codes if c.code == assignment.code), None)
+            if code and code.requires_aha and (assignment.effective_category in {"", "Unmapped"}):
+                unmapped_remaining += 1
+
+    generate_clicked = st.button(
+        "Generate Section 11 Run",
+        type="primary",
+        disabled=not (parsed and assignments and state.get("source_path")) or unmapped_remaining > 0,
+    )
+
+    if generate_clicked and parsed and assignments and state.get("source_path"):
+        try:
+            run = run_pipeline(
+                state["source_path"],
+                collection_name=getattr(st.session_state.agent_deps, "collection_name", None),
+                overrides=state.get("overrides", {}),
+                upload_artifacts=False,
+            )
+            state["run"] = run
+            st.success(f"Run {run.run_id} generated.")
+        except Exception as exc:  # pragma: no cover
+            st.error(f"Generation failed: {exc}")
+
+    run = state.get("run")
+    if run:
+        st.markdown("### Compliance Matrix")
+        matrix_rows = [
+            {
+                "Category": row.category,
+                "Codes": ", ".join(row.codes),
+                "AHA Status": row.aha_status.value,
+                "Safety Plan Status": row.plan_status.value,
+                "Project Evidence": row.project_evidence_count,
+                "EM Evidence": row.em_evidence_count,
+            }
+            for row in run.matrix
+        ]
+        st.dataframe(matrix_rows, use_container_width=True)
+
+        st.markdown("### Downloads")
+        if run.artifacts.markdown_path.exists():
+            st.download_button(
+                "Download section11.md",
+                run.artifacts.markdown_path.read_bytes(),
+                file_name=run.artifacts.markdown_path.name,
+                mime="text/markdown",
+            )
+        if run.artifacts.docx_path.exists():
+            st.download_button(
+                "Download section11.docx",
+                run.artifacts.docx_path.read_bytes(),
+                file_name=run.artifacts.docx_path.name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        if run.artifacts.json_report_path.exists():
+            st.download_button(
+                "Download section11_report.json",
+                run.artifacts.json_report_path.read_bytes(),
+                file_name=run.artifacts.json_report_path.name,
+                mime="application/json",
+            )
+        if run.artifacts.manifest_path.exists():
+            st.download_button(
+                "Download manifest.json",
+                run.artifacts.manifest_path.read_bytes(),
+                file_name=run.artifacts.manifest_path.name,
+                mime="application/json",
+            )
+
+        st.markdown("### Run Log & Diagnostics")
+        st.json(
+            {
+                "run_id": run.run_id,
+                "source": str(run.source_file),
+                "summary": {
+                    "codes_found": len(run.parsed.codes),
+                    "aha_required": sum(1 for c in run.parsed.codes if c.requires_aha),
+                    "pending_ahas": sum(1 for b in run.bundles if b.aha.status != CategoryStatus.required),
+                    "pending_plans": sum(1 for b in run.bundles if b.plan.status != CategoryStatus.required),
+                },
+                "artifacts": {
+                    "markdown": str(run.artifacts.markdown_path),
+                    "docx": str(run.artifacts.docx_path),
+                    "json": str(run.artifacts.json_report_path),
+                    "manifest": str(run.artifacts.manifest_path),
+                },
+            }
+        )
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -663,6 +897,11 @@ async def main():
                         st.caption(v)
         except Exception:
             st.caption("Run history unavailable.")
+
+    st.markdown("---")
+    section11_tab = st.tabs(["Section 11 Generator — Test"])[0]
+    with section11_tab:
+        render_section11_tab()
 
     # Display all messages from the conversation so far
     # Each message is either a ModelRequest or ModelResponse.
