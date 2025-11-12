@@ -60,7 +60,10 @@ def _write_bundle_markdown(bundle: CategoryBundle) -> List[str]:
         for citation in bundle.aha.citations:
             section = citation.get("section_path", "")
             page = citation.get("page_label") or citation.get("page_number") or ""
-            lines.append(f"- § {section} (p. {page})")
+            if page:
+                lines.append(f"- § {section} (p. {page})")
+            else:
+                lines.append(f"- § {section}")
         lines.append("")
     if bundle.aha.pending_reason:
         lines.append(f"_Status: {bundle.aha.pending_reason}_")
@@ -88,7 +91,10 @@ def _write_bundle_markdown(bundle: CategoryBundle) -> List[str]:
         for citation in bundle.plan.citations:
             section = citation.get("section_path", "")
             page = citation.get("page_label") or citation.get("page_number") or ""
-            lines.append(f"- § {section} (p. {page})")
+            if page:
+                lines.append(f"- § {section} (p. {page})")
+            else:
+                lines.append(f"- § {section}")
         lines.append("")
     if bundle.plan.pending_reason:
         lines.append(f"_Status: {bundle.plan.pending_reason}_")
@@ -184,22 +190,60 @@ def write_section11_docx(base_dir: Path, bundles: List[CategoryBundle], matrix: 
 
 def write_section11_json(base_dir: Path, run: Section11Run) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Serialize with enum values instead of enum objects
+    def serialize_status(status: CategoryStatus) -> str:
+        return status.value
+    
+    def serialize_matrix_row(row: ComplianceMatrixRow) -> Dict[str, object]:
+        return {
+            "category": row.category,
+            "codes": row.codes,
+            "aha_status": serialize_status(row.aha_status),
+            "plan_status": serialize_status(row.plan_status),
+            "project_evidence_count": row.project_evidence_count,
+            "em_evidence_count": row.em_evidence_count,
+            "aha_link": row.aha_link,
+            "plan_link": row.plan_link,
+        }
+    
+    def serialize_aha(aha) -> Dict[str, object]:
+        return {
+            "hazards": aha.hazards,
+            "narrative": aha.narrative,
+            "citations": aha.citations,
+            "status": serialize_status(aha.status),
+            "pending_reason": aha.pending_reason,
+        }
+    
+    def serialize_plan(plan) -> Dict[str, object]:
+        return {
+            "controls": plan.controls,
+            "ppe": plan.ppe,
+            "permits": plan.permits,
+            "citations": plan.citations,
+            "project_evidence": plan.project_evidence,
+            "em_evidence": plan.em_evidence,
+            "status": serialize_status(plan.status),
+            "pending_reason": plan.pending_reason,
+        }
+    
     payload: Dict[str, object] = {
         "run_id": run.run_id,
         "source_file": run.source_file.name,
-        "matrix": [row.model_dump() for row in run.matrix],
+        "matrix": [serialize_matrix_row(row) for row in run.matrix],
         "categories": [
             {
                 "category": bundle.category,
                 "codes": bundle.codes,
-                "aha": bundle.aha.model_dump(),
-                "plan": bundle.plan.model_dump(),
+                "aha": serialize_aha(bundle.aha),
+                "plan": serialize_plan(bundle.plan),
             }
             for bundle in run.bundles
         ],
     }
     path = base_dir / "section11_report.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
 
 

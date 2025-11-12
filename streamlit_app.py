@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 # Import all the message part classes
 from pydantic_ai.messages import (
@@ -51,11 +51,9 @@ from section11.constants import EM_385_CATEGORIES
 from section11.models import CategoryAssignment, CategoryStatus, ParsedSpec, Section11Run
 from section11.pipeline import (
     apply_overrides,
-    build_assignments,
     create_context,
-    enrich_codes_with_firestore,
-    parse_and_detect,
     persist_uploaded_file,
+    prepare_section11,
     reconcile_categories,
     run_pipeline,
 )
@@ -142,32 +140,49 @@ def _section11_state() -> dict:
         st.session_state.section11_state = {
             "context": None,
             "source_path": None,
-            "parsed": None,
-            "assignments": None,
+            "prepared": None,
             "overrides": {},
             "run": None,
+            "collection_name": None,
+            "upload_to_firebase": True,
+            "file_signature": None,
         }
     return st.session_state.section11_state
 
 
-def _render_section11_metrics(parsed: ParsedSpec | None, assignments: list[CategoryAssignment] | None, run: Section11Run | None):
-    codes_found = len(parsed.codes) if parsed else 0
-    require_aha = sum(1 for code in parsed.codes if code.requires_aha) if parsed else 0
-    categories = 0
+def _render_section11_metrics(
+    parsed_all: ParsedSpec | None,
+    parsed_for_generation: ParsedSpec | None,
+    assignments: list[CategoryAssignment] | None,
+    run: Section11Run | None,
+) -> None:
+    codes_found = len(parsed_all.codes) if parsed_all else 0
+    require_aha = sum(1 for code in (parsed_all.codes if parsed_all else []) if code.requires_aha)
+
+    effective_categories: set[str] = set()
     unmapped = 0
-    if parsed and assignments:
-        effective = set()
-        for assignment in assignments:
-            code = next((c for c in parsed.codes if c.code == assignment.code), None)
-            if code and code.requires_aha:
-                effective.add(assignment.effective_category or "Unmapped")
-                if assignment.effective_category in {"", "Unmapped"}:
+    if parsed_for_generation:
+        for code in parsed_for_generation.codes:
+            category = (code.suggested_category or "Unmapped").strip() or "Unmapped"
+            if category.lower() == "unmapped":
                     unmapped += 1
-        categories = len(effective)
-    aha_created = sum(1 for bundle in (run.bundles if run else []) if bundle.aha.status == CategoryStatus.required)
-    aha_pending = sum(1 for bundle in (run.bundles if run else []) if bundle.aha.status != CategoryStatus.required)
-    plan_created = sum(1 for bundle in (run.bundles if run else []) if bundle.plan.status == CategoryStatus.required)
-    plan_pending = sum(1 for bundle in (run.bundles if run else []) if bundle.plan.status != CategoryStatus.required)
+            else:
+                effective_categories.add(category)
+
+    categories = len(effective_categories)
+
+    aha_created = sum(
+        1 for bundle in (run.bundles if run else []) if bundle.aha.status == CategoryStatus.required
+    )
+    aha_pending = sum(
+        1 for bundle in (run.bundles if run else []) if bundle.aha.status != CategoryStatus.required
+    )
+    plan_created = sum(
+        1 for bundle in (run.bundles if run else []) if bundle.plan.status == CategoryStatus.required
+    )
+    plan_pending = sum(
+        1 for bundle in (run.bundles if run else []) if bundle.plan.status != CategoryStatus.required
+    )
 
     cols = st.columns(6)
     cols[0].metric("Codes Found", codes_found)
@@ -182,119 +197,282 @@ def render_section11_tab():
     state = _section11_state()
     st.subheader("Section 11 Generator — Test")
 
-    uploaded = st.file_uploader(
-        "Upload Section 11 design spec", type=["pdf", "docx"], accept_multiple_files=False, key="section11_upload"
-    )
+    metrics_container = st.container()
 
-    parse_clicked = st.button("Parse & Detect", type="primary", disabled=uploaded is None)
+    # Determine active collection
+    collection_name = None
+    if hasattr(st.session_state, "agent_deps") and st.session_state.agent_deps:
+        collection_name = getattr(st.session_state.agent_deps, "collection_name", None)
+    if not collection_name:
+        from utils import resolve_collection_name
+
+        collection_name = resolve_collection_name(None)
+    if collection_name and collection_name.strip() == "docs":
+        collection_name = "em385_2024"
+    state["collection_name"] = collection_name
+    st.caption(f"Active EM 385 collection: {collection_name or '—'}")
+
+    upload_col, button_col = st.columns([4, 1])
+    with upload_col:
+        uploaded = st.file_uploader(
+            "Upload Section 11 design spec (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=False, key="section11_upload"
+        )
+    with button_col:
+        parse_clicked = st.button(
+            "Parse & Detect",
+            type="primary",
+            use_container_width=True,
+            disabled=uploaded is None,
+            key="section11_parse_btn",
+        )
+
     if parse_clicked and uploaded is not None:
-        try:
-            context = create_context(collection_name=getattr(st.session_state.agent_deps, "collection_name", None))
-            source_path = persist_uploaded_file(context, uploaded.name, uploaded.getbuffer())
-            parsed = parse_and_detect(source_path, context)
+        file_signature = (uploaded.name, uploaded.size)
+        with st.status("Parsing specification…", expanded=True) as status:
             try:
-                parsed = enrich_codes_with_firestore(parsed)
-            except Exception as exc:  # pragma: no cover
-                st.warning(f"Firebase lookups unavailable: {exc}")
-            assignments = build_assignments(parsed)
-            state.update(
-                {
-                    "context": context,
-                    "source_path": source_path,
-                    "parsed": parsed,
-                    "assignments": assignments,
-                    "overrides": {},
-                    "run": None,
-                }
-            )
-            st.success("Parsing complete.")
-        except Exception as exc:  # pragma: no cover
-            st.error(f"Failed to parse: {exc}")
+                status.update(label="Creating run context…", state="running")
+                context = create_context(collection_name=collection_name)
+                source_path = persist_uploaded_file(context, uploaded.name, uploaded.getbuffer())
 
-    parsed: ParsedSpec | None = state.get("parsed")
-    assignments: list[CategoryAssignment] | None = state.get("assignments")
+                status.update(label="Analyzing codes & Firebase decisions…", state="running")
+                prepared = prepare_section11(
+                    source_path=source_path,
+                    context=context,
+                    collection_name=collection_name,
+                    overrides={},
+                )
+
+                state.update(
+                    {
+                        "context": context,
+                        "source_path": source_path,
+                        "prepared": prepared,
+                        "overrides": {},
+                        "run": None,
+                        "file_signature": file_signature,
+                        "category_editor_key": f"section11_category_editor_{context.run_id}",
+                    }
+                )
+                status.update(label="Parse complete.", state="complete")
+                st.success(f"Parsed {uploaded.name} successfully. Review results below.")
+            except Exception as exc:  # pragma: no cover - defensive UI handling
+                import traceback
+
+                status.update(label="Parse failed", state="error")
+                st.error(f"Failed to parse: {exc}")
+                st.code(traceback.format_exc())
+                state["prepared"] = None
+                state["run"] = None
+
+    prepared = state.get("prepared")
     run: Section11Run | None = state.get("run")
 
-    _render_section11_metrics(parsed, assignments, run)
+    # Build Firebase status map for display
+    firebase_status: Dict[str, str] = {}
+    if prepared:
+        for code in prepared.firebase_results.get("codes_requiring_aha", []):
+            firebase_status[code] = "Requires AHA"
+        for code in prepared.firebase_results.get("codes_not_requiring", []):
+            firebase_status[code] = "Not Required"
+        for code in prepared.firebase_results.get("codes_unknown", []):
+            firebase_status[code] = "Unknown"
 
-    if parsed:
-        st.markdown("### Scope Summary")
-        for line in parsed.scope_summary:
-            st.markdown(f"- {line}")
+    st.markdown("### Parse & Detect Results")
+    if prepared and prepared.parsed_all_codes.scope_summary:
+        st.markdown("**Project Scope (extracted from document)**")
+        for line in prepared.parsed_all_codes.scope_summary:
+                st.markdown(f"- {line}")
+    elif prepared:
+        st.info("No structured scope section found; full document text will be used for context.")
 
-        st.markdown("### Codes Detected")
-        rows = [
+    if prepared:
+        verification = prepared.verification
+        st.caption(
+            f"Document length: {verification.get('document_length', 0)} characters · "
+            f"Codes identified: {len(prepared.combined_codes)}"
+        )
+
+        code_rows = []
+        for code in prepared.parsed_all_codes.codes:
+            source_label = ""
+            if code.sources:
+                hit = code.sources[0]
+                parts = []
+                if hit.page:
+                    parts.append(f"p. {hit.page}")
+                if hit.heading:
+                    parts.append(hit.heading)
+                source_label = " / ".join(parts)
+            requirement = firebase_status.get(code.code, "Unknown")
+        code_rows.append(
             {
                 "Code": code.code,
-                "Title": code.title,
-                "Requires AHA": code.requires_aha,
+                "Title": code.title or "",
+                "Requires AHA": requirement,
                 "Suggested Category": code.suggested_category or "Unmapped",
-                "Decision Source": code.decision_source,
-                "Notes": code.notes,
+                "Decision Source": code.decision_source or "",
+                "Confidence": code.confidence or "",
+                "Source (Page/Heading)": source_label,
+                "Notes": code.notes or "",
             }
-            for code in parsed.codes
-        ]
-        st.dataframe(rows, use_container_width=True)
+        )
 
-        if parsed.hazard_phrases:
-            st.markdown("### Potential Hazard Phrases")
-            st.write("\n".join(f"• {phrase}" for phrase in parsed.hazard_phrases))
+        view_choice = st.radio(
+            "Show codes:",
+            options=("All codes", "Requires AHA"),
+            horizontal=True,
+            key="section11_codes_view",
+        )
+        if view_choice == "Requires AHA":
+            filtered = [row for row in code_rows if row["Requires AHA"] in {"Requires AHA", "Unknown"}]
+        else:
+            filtered = code_rows
+        st.dataframe(filtered, use_container_width=True, height=320 if filtered else 120)
 
-    overrides = state.get("overrides", {})
-    if parsed and assignments:
-        requiring = [code for code in parsed.codes if code.requires_aha]
-        if requiring:
-            st.markdown("### Category Review")
-            for code in requiring:
-                assignment = next((a for a in assignments if a.code == code.code), None)
-                if not assignment:
-                    continue
-                default = assignment.override or assignment.suggested_category or "Unmapped"
-                try:
-                    index = EM_385_CATEGORIES.index(default)
-                except ValueError:
-                    index = EM_385_CATEGORIES.index("Unmapped") if "Unmapped" in EM_385_CATEGORIES else 0
-                selection = st.selectbox(
-                    f"{code.code}",
-                    EM_385_CATEGORIES,
-                    index=index,
-                    key=f"section11_category_{code.code}",
-                    help=assignment.why or "",
-                )
-                overrides[code.code] = selection
-            state["overrides"] = overrides
-            apply_overrides(assignments, overrides)
-            reconcile_categories(parsed, assignments)
+        st.markdown("### AHA Requirement Summary")
+        cols = st.columns(3)
+        cols[0].metric("Requires AHA", len(prepared.firebase_results.get("codes_requiring_aha", [])))
+        cols[1].metric("Not Required", len(prepared.firebase_results.get("codes_not_requiring", [])))
+        cols[2].metric("Unknown", len(prepared.firebase_results.get("codes_unknown", [])))
 
+    # Category review and overrides
     unmapped_remaining = 0
-    if parsed and assignments:
-        for assignment in assignments:
-            code = next((c for c in parsed.codes if c.code == assignment.code), None)
-            if code and code.requires_aha and (assignment.effective_category in {"", "Unmapped"}):
+    if prepared and prepared.parsed_for_generation.codes:
+        st.markdown("### Category Review")
+        st.caption("Review each code that requires an AHA. Adjust the category if needed. All codes must be mapped before generation.")
+
+        category_options = sorted(
+            {
+                *(cat for cat in EM_385_CATEGORIES),
+                *(assignment.suggested_category or "" for assignment in prepared.assignments),
+            }
+        )
+        category_options = [opt for opt in category_options if opt]
+        if "Unmapped" not in category_options:
+            category_options.append("Unmapped")
+
+        assignment_by_code = {assignment.code: assignment for assignment in prepared.assignments}
+        code_by_id = {code.code: code for code in prepared.parsed_for_generation.codes}
+
+        category_rows = []
+        for assignment in prepared.assignments:
+            code_obj = code_by_id.get(assignment.code)
+            suggested = assignment.suggested_category or "Unmapped"
+            current_override = state["overrides"].get(assignment.code, assignment.override or suggested)
+            effective = current_override or suggested
+            hint = ""
+            if code_obj:
+                hint = (
+                    code_obj.rationale
+                    or code_obj.notes
+                    or code_obj.title
+                    or ", ".join(filter(None, [code_obj.decision_source, str(code_obj.confidence or "")]))
+                )
+            category_rows.append(
+                {
+                    "Code": assignment.code,
+                    "Suggested Category": suggested,
+                    "Override": effective,
+                    "Hint / Keywords": hint,
+                }
+            )
+
+        editor_key = state.get("category_editor_key", "section11_category_editor")
+        edited = st.data_editor(
+            category_rows,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Override": st.column_config.SelectboxColumn(
+                    "Override",
+                    options=category_options,
+                    help="Select the EM 385 category for this code.",
+                )
+            },
+            key=editor_key,
+            use_container_width=True,
+        )
+        edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
+
+        new_overrides: Dict[str, str] = {}
+        for row in edited_rows:
+            code = row.get("Code")
+            suggested = row.get("Suggested Category") or ""
+            override_val = (row.get("Override") or "").strip()
+            if override_val and override_val != suggested:
+                new_overrides[code] = override_val
+
+        # Persist overrides and keep assignment/parsed models in sync
+        state["overrides"] = new_overrides
+        apply_overrides(prepared.assignments, new_overrides)
+        reconcile_categories(prepared.parsed_for_generation, prepared.assignments)
+        for code_obj in prepared.parsed_for_generation.codes:
+            if not code_obj.suggested_category or not code_obj.suggested_category.strip():
+                code_obj.suggested_category = "Unmapped"
+            if (code_obj.suggested_category or "").lower() == "unmapped":
                 unmapped_remaining += 1
 
-    generate_clicked = st.button(
-        "Generate Section 11 Run",
-        type="primary",
-        disabled=not (parsed and assignments and state.get("source_path")) or unmapped_remaining > 0,
-    )
+        if unmapped_remaining:
+            st.warning(f"{unmapped_remaining} code(s) remain unmapped. Map all codes before generating.")
+        else:
+            st.success("All codes are mapped to EM 385 categories.")
+    elif prepared:
+        st.info("No codes requiring AHA were identified. Generation is not required for this spec.")
 
-    if generate_clicked and parsed and assignments and state.get("source_path"):
-        try:
-            run = run_pipeline(
-                state["source_path"],
-                collection_name=getattr(st.session_state.agent_deps, "collection_name", None),
-                overrides=state.get("overrides", {}),
-                upload_artifacts=False,
-            )
-            state["run"] = run
-            st.success(f"Run {run.run_id} generated.")
-        except Exception as exc:  # pragma: no cover
-            st.error(f"Generation failed: {exc}")
+    # Metrics (displayed at top of tab)
+    with metrics_container:
+        _render_section11_metrics(
+            prepared.parsed_all_codes if prepared else None,
+            prepared.parsed_for_generation if prepared else None,
+            prepared.assignments if prepared else None,
+            run,
+        )
 
+    # Generation controls
+    if prepared and prepared.parsed_for_generation.codes:
+        st.markdown("### Generate AHAs & Safety Plans")
+        st.caption("Generation produces hazard-only AHAs and control-only Safety Plans for each category.")
+
+        upload_toggle = st.checkbox(
+            "Upload results to Firebase (runs/<run_id>)",
+            value=state.get("upload_to_firebase", True),
+            key="section11_upload_to_firebase",
+        )
+        state["upload_to_firebase"] = upload_toggle
+
+        generate_disabled = unmapped_remaining > 0
+        if st.button(
+            "Generate Section 11 Artifacts",
+            type="primary",
+            disabled=generate_disabled,
+            key="section11_generate_btn",
+        ):
+            if generate_disabled:
+                st.warning("Resolve all unmapped codes before generating.")
+            else:
+                with st.status("Generating Section 11 artifacts…", expanded=True) as status:
+                    try:
+                        status.update(label="Building AHA hazard analyses…", state="running")
+                        run = run_pipeline(
+                            state["source_path"],
+                            collection_name=state.get("collection_name"),
+                            overrides=state.get("overrides"),
+                            upload_artifacts=state.get("upload_to_firebase", True),
+                        )
+                        state["run"] = run
+                        status.update(label="Generation complete.", state="complete")
+                        st.success(f"Run {run.run_id} complete. Download artifacts below.")
+                    except Exception as exc:  # pragma: no cover
+                        import traceback
+
+                        status.update(label="Generation failed", state="error")
+                        st.error(f"Generation failed: {exc}")
+                        st.code(traceback.format_exc())
+
+    # Results & downloads
     run = state.get("run")
     if run:
-        st.markdown("### Compliance Matrix")
+        st.markdown("### Results & Compliance Matrix")
         matrix_rows = [
             {
                 "Category": row.category,
@@ -307,6 +485,38 @@ def render_section11_tab():
             for row in run.matrix
         ]
         st.dataframe(matrix_rows, use_container_width=True)
+
+        with st.expander("Category Details & Evidence", expanded=False):
+            for bundle in run.bundles:
+                st.markdown(f"#### {bundle.category} ({len(bundle.codes)} codes)")
+                st.markdown(f"Codes: {', '.join(bundle.codes) if bundle.codes else '—'}")
+                if bundle.aha.hazards:
+                    st.markdown("**Hazards Identified**")
+                    for hazard in bundle.aha.hazards:
+                        st.markdown(f"- {hazard}")
+                if bundle.plan.controls or bundle.plan.ppe or bundle.plan.permits:
+                    st.markdown("**Controls & Safety Plan Highlights**")
+                    for item in bundle.plan.controls[:5]:
+                        st.markdown(f"- {item}")
+                    if bundle.plan.ppe:
+                        st.markdown(f"PPE: {', '.join(bundle.plan.ppe[:5])}")
+                    if bundle.plan.permits:
+                        st.markdown(f"Permits/Training: {', '.join(bundle.plan.permits[:5])}")
+                if bundle.aha.citations or bundle.plan.citations:
+                    st.markdown(
+                        "Citations: "
+                        + ", ".join(
+                            sorted(
+                                {
+                                    cite.get("section_path", "")
+                                    for cite in (bundle.aha.citations + bundle.plan.citations)
+                                    if cite.get("section_path")
+                                }
+                            )
+                        )
+                        or "—"
+                    )
+                st.markdown("---")
 
         st.markdown("### Downloads")
         if run.artifacts.markdown_path.exists():
@@ -355,8 +565,11 @@ def render_section11_tab():
                     "json": str(run.artifacts.json_report_path),
                     "manifest": str(run.artifacts.manifest_path),
                 },
+                "overrides": state.get("overrides", {}),
             }
         )
+    elif prepared and not prepared.parsed_for_generation.codes:
+        st.info("No AHAs were generated because no codes require an AHA.")
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

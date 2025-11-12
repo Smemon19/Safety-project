@@ -12,7 +12,6 @@ EM_385_CATEGORIES: list[str] = [
     "Material Handling & Storage",
     "Fire Prevention & Hot Work",
     "Scaffolding & Access Systems",
-    "Lockout/Tagout",
     "Hazardous Energy / LOTO",
     "Environmental Controls",
     "Mechanical Equipment",
